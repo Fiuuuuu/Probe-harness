@@ -214,3 +214,57 @@ async def test_provider_exception_finalizes_then_reraises(tmp_path: Path) -> Non
     )
     assert events[-1]["type"] == "run_finished"
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_store_write_failure_finalizes_and_reraises(tmp_path: Path) -> None:
+    script = [
+        {
+            "tool_calls": [
+                {
+                    "id": "call_bash",
+                    "function": {
+                        "name": "bash",
+                        "arguments": '{"command": "echo hi"}',
+                    },
+                }
+            ],
+            "finish_reason": "tool_calls",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+    ]
+    db = tmp_path / "fail.db"
+    store = Store(db)
+    await store.connect()
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"user_message": "go"}), encoding="utf-8")
+
+    real_execute = store.execute
+
+    async def execute_fail_on_tool_insert(sql: str, params=()):
+        if "INSERT INTO tool_calls" in sql:
+            raise RuntimeError("simulated store write failure")
+        return await real_execute(sql, params)
+
+    store.execute = execute_fail_on_tool_insert  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="simulated store write failure"):
+        await run_agent_loop(
+            store,
+            FakeProvider(script),
+            task,
+            provider_name="fake",
+            model="fake",
+        )
+
+    run = await store.fetchone(
+        "SELECT id, status, stop_reason FROM runs ORDER BY started_at DESC LIMIT 1"
+    )
+    assert run["status"] == "failed"
+    assert run["stop_reason"] == "exception"
+    events = await store.fetchall(
+        "SELECT type FROM events WHERE run_id = ? ORDER BY seq",
+        (run["id"],),
+    )
+    assert events[-1]["type"] == "run_finished"
+    await store.close()
