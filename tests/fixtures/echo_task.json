@@ -1,0 +1,56 @@
+{
+  "system": "You are a test agent. Use tools when asked, then finish with a short answer.",
+  "user_message": "Run bash echo hello, then read_file on README.md (first line only via limit 1), then reply done.",
+  "max_steps": 10,
+  "fake_script": [
+    {
+      "tool_calls": [
+        {
+          "id": "call_echo",
+          "function": {
+            "name": "bash",
+            "arguments": "{\"command\": \"echo hello\"}"
+          }
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 120,
+        "completion_tokens": 20,
+        "prompt_tokens_details": {"cached_tokens": 80},
+        "prompt_cache_hit_tokens": 80,
+        "prompt_cache_miss_tokens": 40
+      }
+    },
+    {
+      "tool_calls": [
+        {
+          "id": "call_read",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\": \"README.md\", \"offset\": 0, \"limit\": 1}"
+          }
+        }
+      ],
+      "finish_reason": "tool_calls",
+      "usage": {
+        "prompt_tokens": 200,
+        "completion_tokens": 25,
+        "prompt_tokens_details": {"cached_tokens": 150},
+        "prompt_cache_hit_tokens": 150,
+        "prompt_cache_miss_tokens": 50
+      }
+    },
+    {
+      "content": "done",
+      "finish_reason": "stop",
+      "usage": {
+        "prompt_tokens": 350,
+        "completion_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 300},
+        "prompt_cache_hit_tokens": 300,
+        "prompt_cache_miss_tokens": 50
+      }
+    }
+  ]
+}
