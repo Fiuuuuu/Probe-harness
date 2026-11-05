@@ -15,6 +15,7 @@ def checkpoint_meta(
     fake_script_index: int = 0,
     hook_metrics: dict[str, int] | None = None,
     model_response_done: bool = False,
+    budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "fake_script_index": fake_script_index,
@@ -22,6 +23,8 @@ def checkpoint_meta(
     }
     if hook_metrics:
         payload["hook_metrics"] = hook_metrics
+    if budget is not None:
+        payload["budget"] = budget
     return payload
 
 

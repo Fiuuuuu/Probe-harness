@@ -11,7 +11,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.core.budget import (
+    BudgetLimits,
+    RepeatedCallGuard,
+    RunBudget,
+    cache_prefix_fingerprint,
+)
 from probe_harness.core.context import prepare_context
+from probe_harness.core.goal import evaluate_goal, goal_feedback_message
 from probe_harness.core.hooks import (
     HookBus,
     HookEvent,
@@ -226,6 +233,63 @@ def _maybe_hard_kill(task: dict[str, Any], task_path: Path, when: str) -> None:
         raise SimulatedHardKill(when)
 
 
+async def _emit_budget_state(
+    events: EventWriter,
+    run_id: str,
+    step: int,
+    budget: RunBudget,
+    *,
+    transitions: list[Any] | None = None,
+) -> None:
+    payload = budget.snapshot_event_payload()
+    if transitions:
+        payload["transitions"] = [
+            {"dimension": t.dimension, "from": t.from_level, "to": t.to_level} for t in transitions
+        ]
+    await events.append(
+        run_id,
+        step,
+        "budget_state",
+        time.time(),
+        json.dumps(payload, ensure_ascii=False),
+    )
+
+
+async def _synthetic_tool_results_for_policy(
+    messages: list[dict[str, Any]],
+    events: EventWriter,
+    run_id: str,
+    step: int,
+    tool_calls: list[ToolCallSpec],
+    *,
+    reason: str,
+    kind: str,
+) -> None:
+    for tc in tool_calls:
+        payload = json.dumps(
+            {"error": f"tool call interrupted: {reason}", "is_error": True},
+            ensure_ascii=False,
+        )
+        messages.append({"role": "tool", "tool_call_id": tc.id, "content": payload})
+        await events.append(
+            run_id,
+            step,
+            "protocol_repair",
+            time.time(),
+            json.dumps(
+                {"kind": kind, "tool_call_id": tc.id, "reason": reason},
+                ensure_ascii=False,
+            ),
+        )
+        await events.append(
+            run_id,
+            step,
+            "tool_result",
+            time.time(),
+            json.dumps({"call_id": tc.id, "synthetic": True, "reason": reason}),
+        )
+
+
 def _allow_task_test_controls(task_path: Path) -> bool:
     """Task JSON knobs (tool_choice, reject_length_*) are for tests/live probes only."""
     if os.environ.get("HARNESS_ALLOW_TEST_CONTROLS") == "1":
@@ -299,6 +363,12 @@ async def run_agent_loop(
         ]
 
     script = task.get("fake_script") or []
+    budget_limits = BudgetLimits.from_task(task)
+    run_budget: RunBudget | None = (
+        RunBudget(limits=budget_limits) if budget_limits is not None else None
+    )
+    repeat_guard = RepeatedCallGuard()
+    cache_prefix_ref: str | None = None
     name_map = ToolNameMap()
     thinking_enabled = task.get("thinking_enabled")
     if provider_name == "fake" and script:
@@ -318,6 +388,13 @@ async def run_agent_loop(
     try:
         while step < max_steps:
             try:
+                if run_budget is not None:
+                    may_call, hard_reason = run_budget.check_before_model_call()
+                    if not may_call:
+                        status = "failed"
+                        stop_reason = hard_reason or "run_budget"
+                        break
+
                 if skip_model_once:
                     provider_messages = merge_system_messages_openai(messages)
                     api_tools = normalise_tool_schemas(TOOL_SCHEMAS, name_map=name_map)
@@ -329,6 +406,17 @@ async def run_agent_loop(
                         repair_reason=task.get("pairing_repair_reason", "interrupted"),
                         name_map=name_map,
                     )
+                    if run_budget is not None:
+                        run_budget.ensure_finalization_user_message(messages, task)
+                        provider_messages, _, api_tools = prepare_context(
+                            messages,
+                            TOOL_SCHEMAS,
+                            repair_reason=task.get("pairing_repair_reason", "interrupted"),
+                            name_map=name_map,
+                        )
+                prefix_fp = cache_prefix_fingerprint(provider_messages, api_tools)
+                if cache_prefix_ref is None:
+                    cache_prefix_ref = prefix_fp
                 for repair in repairs:
                     await events.append(
                         run_id,
@@ -348,6 +436,8 @@ async def run_agent_loop(
                             "step": step,
                             "message_count": len(provider_messages),
                             "repairs": len(repairs),
+                            "cache_prefix_fingerprint": prefix_fp,
+                            "cache_prefix_stable": prefix_fp == cache_prefix_ref,
                         }
                     ),
                 )
@@ -395,7 +485,10 @@ async def run_agent_loop(
                         step=step,
                         boundary=CHECKPOINT_PRE_MODEL,
                         messages=messages,
-                        meta=checkpoint_meta(fake_script_index=fake_idx),
+                        meta=checkpoint_meta(
+                            fake_script_index=fake_idx,
+                            budget=run_budget.to_dict() if run_budget else None,
+                        ),
                     )
                     _maybe_hard_kill(task, task_path, CHECKPOINT_PRE_MODEL)
 
@@ -471,6 +564,32 @@ async def run_agent_loop(
                         call_rows=call_rows,
                         provider_name=provider_name,
                     )
+                    if run_budget is not None:
+                        usage_raw = turn.usage or {}
+                        if not usage_raw and call_rows:
+                            usage_raw = call_rows[-1].usage
+                        transitions = run_budget.record_model_usage(
+                            usage_raw, provider_name=provider_name
+                        )
+                        if transitions:
+                            await _emit_budget_state(
+                                events, run_id, step, run_budget, transitions=transitions
+                            )
+                        may_continue, after_reason = run_budget.check_after_model_call()
+                        if not may_continue:
+                            if turn.tool_calls:
+                                await _synthetic_tool_results_for_policy(
+                                    messages,
+                                    events,
+                                    run_id,
+                                    step,
+                                    turn.tool_calls,
+                                    reason=after_reason or "run_budget",
+                                    kind="budget_hard_stop",
+                                )
+                            status = "failed"
+                            stop_reason = after_reason or "run_budget"
+                            break
                     if provider_name == "fake":
                         fake_script_index = getattr(provider, "_index", fake_script_index)
 
@@ -532,6 +651,7 @@ async def run_agent_loop(
                             meta=checkpoint_meta(
                                 fake_script_index=fake_script_index,
                                 model_response_done=True,
+                                budget=run_budget.to_dict() if run_budget else None,
                             ),
                         )
 
@@ -551,6 +671,20 @@ async def run_agent_loop(
                 assert turn is not None
                 if not turn.tool_calls:
                     stop_reason = turn.finish_reason or "stop"
+                    break
+
+                if run_budget is not None and run_budget.combined_level == "finalizing":
+                    await _synthetic_tool_results_for_policy(
+                        messages,
+                        events,
+                        run_id,
+                        step,
+                        turn.tool_calls,
+                        reason="run budget finalization",
+                        kind="budget_finalization",
+                    )
+                    status = "failed"
+                    stop_reason = "run_budget"
                     break
 
                 truncated = bool(turn.tool_calls) and (
@@ -613,6 +747,29 @@ async def run_agent_loop(
                     )
                     step += 1
                     continue
+
+                pending_submit_goal = False
+                submit_summary = ""
+                repeat_stop: str | None = None
+                for tc in turn.tool_calls:
+                    raw_name = denormalise_tool_name(tc.name, name_map=name_map)
+                    norm = normalise_tool_name(raw_name, name_map=name_map)
+                    repeat_stop = repeat_guard.note_tool_call(norm, tc.arguments)
+                    if repeat_stop:
+                        break
+                if repeat_stop:
+                    await _synthetic_tool_results_for_policy(
+                        messages,
+                        events,
+                        run_id,
+                        step,
+                        turn.tool_calls,
+                        reason=repeat_stop,
+                        kind="repeated_identical_call",
+                    )
+                    status = "failed"
+                    stop_reason = repeat_stop
+                    break
 
                 for tc in turn.tool_calls:
                     raw_name = denormalise_tool_name(tc.name, name_map=name_map)
@@ -796,6 +953,44 @@ async def run_agent_loop(
                             "content": out_text,
                         }
                     )
+                    if norm == "submit" and result.get("submitted"):
+                        pending_submit_goal = True
+                        submit_summary = str(result.get("summary", ""))
+
+                if repeat_stop:
+                    break
+
+                if pending_submit_goal:
+                    goal_result = evaluate_goal(
+                        task, assistant_content=submit_summary or turn.content
+                    )
+                    await events.append(
+                        run_id,
+                        step,
+                        "goal_check",
+                        time.time(),
+                        json.dumps(goal_result.as_dict(), ensure_ascii=False),
+                    )
+                    if goal_result.passed:
+                        status = "submitted"
+                        stop_reason = "goal_met"
+                        await events.append(
+                            run_id,
+                            step,
+                            "submitted",
+                            time.time(),
+                            json.dumps(
+                                {"summary": submit_summary, "goal": goal_result.details},
+                                ensure_ascii=False,
+                            ),
+                        )
+                        break
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": goal_feedback_message(goal_result),
+                        }
+                    )
 
                 await save_checkpoint(
                     store,
@@ -804,7 +999,10 @@ async def run_agent_loop(
                     step=step,
                     boundary=CHECKPOINT_POST_TOOLS,
                     messages=messages,
-                    meta=checkpoint_meta(fake_script_index=fake_script_index),
+                    meta=checkpoint_meta(
+                        fake_script_index=fake_script_index,
+                        budget=run_budget.to_dict() if run_budget else None,
+                    ),
                 )
                 _maybe_hard_kill(task, task_path, CHECKPOINT_POST_TOOLS)
 
@@ -876,6 +1074,8 @@ async def run_agent_loop(
         hard_killed = True
     finally:
         if not hard_killed:
+            if run_budget is not None:
+                await _emit_budget_state(events, run_id, step, run_budget)
             await _finalize_run(
                 store,
                 events,
