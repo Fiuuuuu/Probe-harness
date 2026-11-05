@@ -55,6 +55,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 provider_name=args.provider,
                 model=model,
                 max_steps=int(task.get("max_steps", 20)),
+                recover_from=args.recover_from,
             )
             row = await store.fetchone(
                 "SELECT stop_reason, status FROM runs WHERE id = ?",
@@ -115,6 +116,7 @@ def main(argv: list[str] | None = None) -> None:
     p_run.add_argument("--provider", default="fake", choices=["fake", "deepseek"])
     p_run.add_argument("--task", required=True)
     p_run.add_argument("--db", default=None, help="SQLite path (default .harness/harness.db)")
+    p_run.add_argument("--recover-from", default=None, help="Recover from interrupted run id")
     p_run.set_defaults(func=_cmd_run)
 
     p_report = sub.add_parser("report", help="Print run metrics")

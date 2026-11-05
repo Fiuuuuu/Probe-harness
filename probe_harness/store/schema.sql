@@ -72,6 +72,20 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
 
+CREATE TABLE IF NOT EXISTS tool_journal (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lineage_run_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    call_id TEXT NOT NULL,
+    norm_name TEXT NOT NULL,
+    args_sha256 TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_json TEXT,
+    ts REAL NOT NULL,
+    UNIQUE (lineage_run_id, call_id),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
 CREATE TABLE IF NOT EXISTS evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,

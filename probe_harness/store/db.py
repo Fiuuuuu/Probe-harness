@@ -31,12 +31,36 @@ class Store:
         await self._conn.executescript(schema)
         await self._migrate(self._conn)
         await self._conn.commit()
+        from probe_harness.runs.service import ensure_startup_sweep
+
+        await ensure_startup_sweep(self)
 
     async def _migrate(self, conn: aiosqlite.Connection) -> None:
         cur = await conn.execute("PRAGMA table_info(model_calls)")
         cols = {row[1] for row in await cur.fetchall()}
         if "response_model" not in cols:
             await conn.execute("ALTER TABLE model_calls ADD COLUMN response_model TEXT")
+        cur = await conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='tool_journal'"
+        )
+        if await cur.fetchone() is None:
+            await conn.execute(
+                """
+                CREATE TABLE tool_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    lineage_run_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    norm_name TEXT NOT NULL,
+                    args_sha256 TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_json TEXT,
+                    ts REAL NOT NULL,
+                    UNIQUE (lineage_run_id, call_id),
+                    FOREIGN KEY (run_id) REFERENCES runs(id)
+                )
+                """
+            )
 
     async def close(self) -> None:
         if self._conn:
