@@ -1,0 +1,855 @@
+{
+ "source": "live probes 2026-11-04/05; MiniMax-M3 (api.minimaxi.com anthropic+openai), deepseek-flash; max_tokens<=64",
+ "results": [
+  {
+   "provider": "minimax-anthropic",
+   "probe": "a_no_tool_result",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid params, tool call result does not follow tool call (2013)\"},\"request_id\":\"073ac05dd559e56fb5790fbc05257b5d\"}"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "b_mismatched_id",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid params, tool result's tool id(toolu_99) not found (2013)\"},\"request_id\":\"073ac05f2277f423b6448a9f839ad277\"}"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "c_result_not_adjacent",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid params, tool call result does not follow tool call (2013)\"},\"request_id\":\"073ac060f0ed556146f607d40aa49097\"}"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "d_two_consecutive_user",
+   "status": 200,
+   "usage": {
+    "input_tokens": 60,
+    "output_tokens": 4,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 128,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "e_system_in_messages",
+   "status": 200,
+   "usage": {
+    "input_tokens": 70,
+    "output_tokens": 11,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 128,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "f_name_dot_slash",
+   "status": 200,
+   "usage": {
+    "input_tokens": 242,
+    "output_tokens": 24,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 162,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "f_name_70chars",
+   "status": 200,
+   "usage": {
+    "input_tokens": 223,
+    "output_tokens": 24,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 212,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "a_no_tool_result",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"bad_request_error\",\"message\":\"invalid params, tool call result does not follow tool call (2013)\",\"http_code\":\"400\"},\"request_id\":\"073ac06bfe13aaed88cebddf7b90ff0c\"}\n"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "b_mismatched_id",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"bad_request_error\",\"message\":\"invalid params, tool result's tool id(call_99) not found (2013)\",\"http_code\":\"400\"},\"request_id\":\"073ac06d49b6af71e6aee49f05ad2a56\"}"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "c_result_not_adjacent",
+   "status": 400,
+   "error_body": "{\"type\":\"error\",\"error\":{\"type\":\"bad_request_error\",\"message\":\"invalid params, tool call result does not follow tool call (2013)\",\"http_code\":\"400\"},\"request_id\":\"073ac06e03463cc29f4cd11c4cad725e\"}\n"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "d_two_consecutive_user",
+   "status": 200,
+   "usage": {
+    "total_tokens": 190,
+    "total_characters": 0,
+    "prompt_tokens": 188,
+    "completion_tokens": 2,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 128
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "f_name_dot_slash",
+   "status": 200,
+   "usage": {
+    "total_tokens": 448,
+    "total_characters": 0,
+    "prompt_tokens": 404,
+    "completion_tokens": 44,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 403
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "f_name_70chars",
+   "status": 200,
+   "usage": {
+    "total_tokens": 458,
+    "total_characters": 0,
+    "prompt_tokens": 435,
+    "completion_tokens": 23,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 434
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "a_no_tool_result",
+   "status": 400,
+   "error_body": "{\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message) (request_id: 952a831a-fb2b-448a-803a-9cbde9266b18)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "b_mismatched_id",
+   "status": 400,
+   "error_body": "{\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id', The following tool_call_ids did not have response messages: call_99 (request_id: f6d75386-aabb-443c-8259-6de7f49dc97b)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "c_result_not_adjacent",
+   "status": 400,
+   "error_body": "{\"error\":{\"message\":\"An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message) (request_id: f3748ee9-b8c5-4019-8674-83221841ebdc)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "d_two_consecutive_user",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 4,
+    "total_tokens": 15,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 11
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "f_name_dot_slash",
+   "status": 400,
+   "error_body": "{\"error\":{\"message\":\"Invalid 'tools[0].function.name': string does not match pattern. Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'. (request_id: d3c71178-0b6d-41b7-98b0-f22b5485f487)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "f_name_70chars",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 297,
+    "completion_tokens": 25,
+    "total_tokens": 322,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 297
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "g1_thinking_toolcall",
+   "status": 200,
+   "usage": {
+    "input_tokens": 308,
+    "output_tokens": 29,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 128,
+    "service_tier": "standard"
+   },
+   "stop_reason": "tool_use"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "g2_drop_thinking",
+   "note": "thinking blocks removed",
+   "status": 200,
+   "usage": {
+    "input_tokens": 99,
+    "output_tokens": 10,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 384,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "g3_keep_thinking",
+   "note": "control: full content",
+   "status": 200,
+   "usage": {
+    "input_tokens": 99,
+    "output_tokens": 10,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 384,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "g1_default_thinking_toolcall",
+   "note": "thinking param omitted",
+   "status": 200,
+   "usage": {
+    "total_tokens": 465,
+    "total_characters": 0,
+    "prompt_tokens": 436,
+    "completion_tokens": 29,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 384
+    }
+   },
+   "finish_reason": "tool_calls"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "g2_drop_reasoning",
+   "note": "reasoning_content / <think> removed",
+   "status": 200,
+   "usage": {
+    "total_tokens": 493,
+    "total_characters": 0,
+    "prompt_tokens": 483,
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 384
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "g3_keep_reasoning",
+   "note": "control: passed back",
+   "status": 200,
+   "usage": {
+    "total_tokens": 493,
+    "total_characters": 0,
+    "prompt_tokens": 483,
+    "completion_tokens": 10,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 384
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g1_default_thinking_toolcall",
+   "note": "thinking param omitted",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 300,
+    "completion_tokens": 52,
+    "total_tokens": 352,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 13
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 300
+   },
+   "finish_reason": "tool_calls"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g2_drop_reasoning",
+   "note": "reasoning_content / <think> removed",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 367,
+    "completion_tokens": 12,
+    "total_tokens": 379,
+    "prompt_tokens_details": {
+     "cached_tokens": 128
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 128,
+    "prompt_cache_miss_tokens": 239
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g3_keep_reasoning",
+   "note": "control: passed back",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 367,
+    "completion_tokens": 11,
+    "total_tokens": 378,
+    "prompt_tokens_details": {
+     "cached_tokens": 128
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 128,
+    "prompt_cache_miss_tokens": 239
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "h1_cache_plain",
+   "status": 200,
+   "usage": {
+    "input_tokens": 2009,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 128,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "h2_cache_plain",
+   "note": "identical repeat, no cache_control",
+   "status": 200,
+   "usage": {
+    "input_tokens": 1,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 2136,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "h3_cache_control",
+   "status": 200,
+   "usage": {
+    "input_tokens": 1,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 2136,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "h4_cache_control",
+   "note": "identical repeat with cache_control",
+   "status": 200,
+   "usage": {
+    "input_tokens": 1,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 2136,
+    "service_tier": "standard"
+   },
+   "stop_reason": "end_turn"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "h1_cache",
+   "status": 200,
+   "usage": {
+    "total_tokens": 2139,
+    "total_characters": 0,
+    "prompt_tokens": 2137,
+    "completion_tokens": 2,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 2136
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "h2_cache",
+   "note": "identical repeat",
+   "status": 200,
+   "usage": {
+    "total_tokens": 2139,
+    "total_characters": 0,
+    "prompt_tokens": 2137,
+    "completion_tokens": 2,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 2136
+    }
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "h1_cache",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 1972,
+    "completion_tokens": 1,
+    "total_tokens": 1973,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 1972
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "h2_cache",
+   "note": "identical repeat",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 1972,
+    "completion_tokens": 1,
+    "total_tokens": 1973,
+    "prompt_tokens_details": {
+     "cached_tokens": 1792
+    },
+    "prompt_cache_hit_tokens": 1792,
+    "prompt_cache_miss_tokens": 180
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "h3_cache",
+   "note": "identical repeat",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 1972,
+    "completion_tokens": 1,
+    "total_tokens": 1973,
+    "prompt_tokens_details": {
+     "cached_tokens": 1792
+    },
+    "prompt_cache_hit_tokens": 1792,
+    "prompt_cache_miss_tokens": 180
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "i_maxtokens_in_toolcall",
+   "status": 200,
+   "usage": {
+    "input_tokens": 271,
+    "output_tokens": 40,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 162,
+    "service_tier": "standard"
+   },
+   "stop_reason": "tool_use"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "i_maxtokens_in_toolcall",
+   "status": 200,
+   "usage": {
+    "total_tokens": 473,
+    "total_characters": 0,
+    "prompt_tokens": 433,
+    "completion_tokens": 40,
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 432
+    }
+   },
+   "finish_reason": "tool_calls"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "i_maxtokens_in_toolcall",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 295,
+    "completion_tokens": 40,
+    "total_tokens": 335,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 0,
+    "prompt_cache_miss_tokens": 295
+   },
+   "finish_reason": "length"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "j_stream_toolcall",
+   "status": 200,
+   "events": [
+    [
+     "message_start",
+     1
+    ],
+    [
+     "ping",
+     1
+    ],
+    [
+     "content_block_start",
+     1
+    ],
+    [
+     "content_block_delta",
+     3
+    ],
+    [
+     "content_block_stop",
+     1
+    ],
+    [
+     "content_block_start",
+     1
+    ],
+    [
+     "content_block_delta",
+     4
+    ],
+    [
+     "content_block_stop",
+     1
+    ],
+    [
+     "message_delta",
+     1
+    ],
+    [
+     "message_stop",
+     1
+    ]
+   ],
+   "arg_fragments": [
+    "",
+    "{",
+    "\"city\":\"Paris\"",
+    "}"
+   ],
+   "usage_seen": [
+    [
+     "message_start",
+     {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "service_tier": "standard"
+     }
+    ],
+    [
+     "message_delta",
+     {
+      "input_tokens": 208,
+      "output_tokens": 35,
+      "cache_read_input_tokens": 202,
+      "service_tier": "standard"
+     }
+    ]
+   ]
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "j_stream_no_include_usage",
+   "status": 200,
+   "events": [
+    [
+     "chunk(choices=1)",
+     11
+    ]
+   ],
+   "arg_fragments": [
+    "",
+    "{",
+    "\"city\":\"Paris\"",
+    "}"
+   ]
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "j_stream_include_usage",
+   "status": 200,
+   "events": [
+    [
+     "chunk(choices=1)",
+     10
+    ],
+    [
+     "chunk(choices=0)",
+     1
+    ]
+   ],
+   "arg_fragments": [
+    "",
+    "{",
+    "\"city\":\"Paris\"",
+    "}"
+   ],
+   "usage_seen": [
+    [
+     "chunk",
+     {
+      "total_tokens": 445,
+      "total_characters": 0,
+      "prompt_tokens": 410,
+      "completion_tokens": 35,
+      "completion_tokens_details": {
+       "reasoning_tokens": 0
+      },
+      "prompt_tokens_details": {
+       "cached_tokens": 409
+      }
+     },
+     0
+    ]
+   ]
+  },
+  {
+   "provider": "deepseek",
+   "probe": "j_stream_no_include_usage",
+   "status": 200,
+   "events": [
+    [
+     "chunk(choices=1)",
+     10
+    ],
+    [
+     "[DONE]",
+     1
+    ]
+   ],
+   "arg_fragments": [
+    "",
+    "{\"",
+    "city",
+    "\"",
+    ": \"",
+    "Paris",
+    "\"",
+    "}"
+   ],
+   "usage_seen": [
+    [
+     "chunk",
+     {
+      "prompt_tokens": 272,
+      "completion_tokens": 38,
+      "total_tokens": 310,
+      "prompt_tokens_details": {
+       "cached_tokens": 0
+      },
+      "prompt_cache_hit_tokens": 0,
+      "prompt_cache_miss_tokens": 272
+     },
+     1
+    ]
+   ]
+  },
+  {
+   "provider": "deepseek",
+   "probe": "j_stream_include_usage",
+   "status": 200,
+   "events": [
+    [
+     "chunk(choices=1)",
+     10
+    ],
+    [
+     "[DONE]",
+     1
+    ]
+   ],
+   "arg_fragments": [
+    "",
+    "{\"",
+    "city",
+    "\"",
+    ": \"",
+    "Paris",
+    "\"",
+    "}"
+   ],
+   "usage_seen": [
+    [
+     "chunk",
+     {
+      "prompt_tokens": 272,
+      "completion_tokens": 38,
+      "total_tokens": 310,
+      "prompt_tokens_details": {
+       "cached_tokens": 128
+      },
+      "prompt_cache_hit_tokens": 128,
+      "prompt_cache_miss_tokens": 144
+     },
+     1
+    ]
+   ]
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "g4_thinking_reasoning_prompt",
+   "status": 200,
+   "usage": {
+    "input_tokens": 229,
+    "output_tokens": 64,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 225,
+    "service_tier": "standard",
+    "output_tokens_details": {
+     "thinking_tokens": 63
+    }
+   },
+   "stop_reason": "max_tokens"
+  },
+  {
+   "provider": "minimax-openai",
+   "probe": "g4_default_thinking_reasoning_prompt",
+   "note": "thinking omitted",
+   "status": 200,
+   "usage": {
+    "total_tokens": 518,
+    "total_characters": 0,
+    "prompt_tokens": 454,
+    "completion_tokens": 64,
+    "completion_tokens_details": {
+     "reasoning_tokens": 63
+    },
+    "prompt_tokens_details": {
+     "cached_tokens": 453
+    }
+   },
+   "finish_reason": "length"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g6_next_user_turn_no_reasoning",
+   "note": "thinking default, no reasoning_content anywhere in history",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 361,
+    "completion_tokens": 2,
+    "total_tokens": 363,
+    "prompt_tokens_details": {
+     "cached_tokens": 128
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 128,
+    "prompt_cache_miss_tokens": 233
+   },
+   "finish_reason": "stop"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g7_explicit_enabled_no_reasoning",
+   "note": "thinking explicitly enabled, fabricated tool turn w/o reasoning_content",
+   "status": 400,
+   "error_body": "{\"error\":{\"message\":\"The `reasoning_content` in the thinking mode must be passed back to the API. (request_id: 2ebbd2e0-728f-480c-8086-391cc2905c34)\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_request_error\"}}"
+  },
+  {
+   "provider": "minimax-anthropic",
+   "probe": "g8_thinking_omitted_reasoning_prompt",
+   "note": "thinking param omitted on Anthropic endpoint",
+   "status": 200,
+   "usage": {
+    "input_tokens": 270,
+    "output_tokens": 64,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 162,
+    "service_tier": "standard"
+   },
+   "stop_reason": "tool_use"
+  },
+  {
+   "provider": "deepseek",
+   "probe": "g9_explicit_enabled_with_reasoning",
+   "note": "control for g7: reasoning_content passed",
+   "status": 200,
+   "usage": {
+    "prompt_tokens": 355,
+    "completion_tokens": 26,
+    "total_tokens": 381,
+    "prompt_tokens_details": {
+     "cached_tokens": 128
+    },
+    "completion_tokens_details": {
+     "reasoning_tokens": 0
+    },
+    "prompt_cache_hit_tokens": 128,
+    "prompt_cache_miss_tokens": 227
+   },
+   "finish_reason": "stop"
+  }
+ ]
+}

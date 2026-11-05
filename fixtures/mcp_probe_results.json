@@ -1,0 +1,68 @@
+[
+ {
+  "label": "1_tools_list_before_initialize",
+  "exchanges": [
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"tools/list\", \"params\": {}}",
+    "received": [
+     "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"Invalid request parameters\",\"data\":\"\"}}"
+    ]
+   }
+  ],
+  "exit_code": 0,
+  "stderr_tail": ""
+ },
+ {
+  "label": "2_initialize_then_list_without_initialized_notification",
+  "exchanges": [
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {\"protocolVersion\": \"2025-06-18\", \"capabilities\": {}, \"clientInfo\": {\"name\": \"probe\", \"version\": \"0\"}}}",
+    "received": [
+     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"prompts\":{\"listChanged\":false},\"resources\":{\"listChanged\":false,\"subscribe\":false},\"tools\":{\"listChanged\":false}},\"protocolVersion\":\"2025-06-18\",\"serverInfo\":{\"name\":\"probe\",\"version\":\"\"}}}"
+    ]
+   },
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\", \"params\": {}}",
+    "received": [
+     "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"description\":\"Echo text\",\"inputSchema\":{\"properties\":{\"text\":{\"title\":\"Text\",\"type\":\"string\"}},\"required\":[\"text\"],\"type\":\"object\",\"title\":\"echoArguments\"},\"name\":\"echo\",\"outputSchema\":{\"properties\":{\"result\":{\"title\":\"Result\",\"type\":\"string\"}},\"required\":[\"result\"],\"type\":\"object\",\"title\":\"echoOutput\"}}]}}"
+    ]
+   }
+  ],
+  "exit_code": 0,
+  "stderr_tail": ""
+ },
+ {
+  "label": "3_correct_order",
+  "exchanges": [
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {\"protocolVersion\": \"2025-06-18\", \"capabilities\": {}, \"clientInfo\": {\"name\": \"probe\", \"version\": \"0\"}}}",
+    "received": [
+     "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"prompts\":{\"listChanged\":false},\"resources\":{\"listChanged\":false,\"subscribe\":false},\"tools\":{\"listChanged\":false}},\"protocolVersion\":\"2025-06-18\",\"serverInfo\":{\"name\":\"probe\",\"version\":\"\"}}}"
+    ]
+   },
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"method\": \"notifications/initialized\"}",
+    "received": []
+   },
+   {
+    "sent": "{\"jsonrpc\": \"2.0\", \"id\": 2, \"method\": \"tools/list\", \"params\": {}}",
+    "received": [
+     "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"description\":\"Echo text\",\"inputSchema\":{\"properties\":{\"text\":{\"title\":\"Text\",\"type\":\"string\"}},\"required\":[\"text\"],\"type\":\"object\",\"title\":\"echoArguments\"},\"name\":\"echo\",\"outputSchema\":{\"properties\":{\"result\":{\"title\":\"Result\",\"type\":\"string\"}},\"required\":[\"result\"],\"type\":\"object\",\"title\":\"echoOutput\"}}]}}"
+    ]
+   }
+  ],
+  "exit_code": 0,
+  "stderr_tail": ""
+ },
+ {
+  "label": "4_multiline_pretty_json_initialize",
+  "exchanges": [
+   {
+    "sent": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {\n    \"protocolVersion\": \"2025-06-18\",\n    \"capabilities\": {},\n    \"clientInfo\": {\n      \"name\": \"probe\",\n      \"version\": \"0\"\n  ",
+    "received": []
+   }
+  ],
+  "exit_code": 0,
+  "stderr_tail": ""
+ }
+]
