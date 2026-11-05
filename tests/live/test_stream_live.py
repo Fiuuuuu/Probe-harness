@@ -37,8 +37,10 @@ async def test_stream_one_completion_live() -> None:
     finally:
         await provider.aclose()
 
-    if turn.finish_reason == "error" and turn.http_status == 0:
-        pytest.skip(f"stream error: {turn.error_body}")
+    if turn.http_status == 0:
+        pytest.fail(f"stream network failure: {turn.error_body}")
+    if turn.finish_reason == "error":
+        pytest.fail(f"stream error: status={turn.http_status} body={turn.error_body!r}")
     assert turn.http_status == 200
     assert len(turn.http_calls) == 1
     assert ledger.total_tokens_used() > 0

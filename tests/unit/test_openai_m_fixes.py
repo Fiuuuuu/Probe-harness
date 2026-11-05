@@ -19,6 +19,14 @@ from probe_harness.providers.usage import normalise_openai_usage
 from probe_harness.store.db import Store
 
 
+@pytest.fixture(autouse=True)
+def _instant_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def _instant_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr("probe_harness.providers.openai_chat.asyncio.sleep", _instant_sleep)
+
+
 def _fixtures() -> list[dict]:
     return json.loads(Path("fixtures/probe_results.json").read_text())["results"]
 
@@ -249,7 +257,106 @@ async def test_mid_stream_disconnect_no_retry(tmp_path: Path) -> None:
         await server.wait_closed()
     assert attempts["n"] == 1
     assert len(turn.http_calls) == 1
-    assert turn.http_calls[0].stop_reason == "stream_interrupted"
+    assert turn.finish_reason == "stream_interrupted"
+    assert turn.tool_calls == []
+    assert ledger.read_cumulative() > 0
+
+
+@pytest.mark.asyncio
+async def test_m7_stream_interrupt_via_loop_no_tool_rows(tmp_path: Path) -> None:
+    body = _sse(_deepseek_stream_chunks()).encode()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        while b"\r\n\r\n" not in (await reader.read(4096)):
+            pass
+        part = body[:200]
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        writer.write(f"{len(part):x}\r\n".encode() + part + b"\r\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    ledger = UsageLedger(path=tmp_path / "m7led.jsonl", task_id="m7")
+    provider = OpenAIChatProvider(
+        api_key="k",
+        ledger=ledger,
+        base_url=f"http://127.0.0.1:{port}",
+    )
+    store = Store(tmp_path / "m7.db")
+    await store.connect()
+    task = tmp_path / "stream_task.json"
+    task.write_text(
+        json.dumps({"user_message": "hi", "max_tokens": 64, "stream": True, "max_steps": 5})
+    )
+    try:
+        run_id = await run_agent_loop(
+            store,
+            provider,
+            task,
+            provider_name="deepseek",
+            model="deepseek-flash",
+            max_steps=5,
+        )
+    finally:
+        await provider.aclose()
+        server.close()
+        await server.wait_closed()
+
+    run = await store.fetchone("SELECT status, stop_reason FROM runs WHERE id = ?", (run_id,))
+    tool_rows = await store.fetchall("SELECT * FROM tool_calls WHERE run_id = ?", (run_id,))
+    mc = await store.fetchall("SELECT * FROM model_calls WHERE run_id = ?", (run_id,))
+    ev = await store.fetchone(
+        "SELECT data_json FROM events WHERE run_id = ? AND type = 'provider_error'",
+        (run_id,),
+    )
+    await store.close()
+    assert ledger.read_cumulative() > 0
+    assert len(mc) == 1
+    assert len(tool_rows) == 0
+    assert run["status"] == "failed"
+    assert run["stop_reason"] == "provider_error"
+    assert ev is not None
+    payload = json.loads(ev["data_json"])
+    assert payload["error_body"]
+
+
+@pytest.mark.asyncio
+async def test_m8_provider_error_event_uses_last_http_status(tmp_path: Path) -> None:
+    posts = {"n": 0}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        posts["n"] += 1
+        raise httpx.ConnectError("boom", request=req)
+
+    provider = OpenAIChatProvider(
+        api_key="k",
+        ledger=UsageLedger(path=tmp_path / "m8.jsonl", task_id="m8"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    store = Store(tmp_path / "m8.db")
+    await store.connect()
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"user_message": "hi", "max_tokens": 8}))
+    with pytest.raises(ProviderCallError):
+        await run_agent_loop(
+            store, provider, task, provider_name="deepseek", model="deepseek-flash"
+        )
+    run = await store.fetchone("SELECT id FROM runs ORDER BY started_at DESC LIMIT 1")
+    ev = await store.fetchone(
+        "SELECT data_json FROM events WHERE run_id = ? AND type = 'provider_error'",
+        (run["id"],),
+    )
+    await store.close()
+    await provider.aclose()
+    payload = json.loads(ev["data_json"])
+    assert payload["http_status"] == 0
+    assert payload["error_body"] == "boom"
 
 
 @pytest.mark.asyncio

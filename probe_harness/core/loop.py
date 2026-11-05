@@ -42,9 +42,11 @@ def config_hash(provider: str, model: str, task_path: str) -> str:
 
 
 def _normalise_usage(provider_name: str, usage: dict[str, Any]) -> dict[str, int]:
-    if provider_name == "anthropic":
+    if provider_name == "fake" or provider_name == "deepseek":
+        return normalise_openai_usage(usage)
+    if provider_name == "anthropic" or provider_name.endswith("-anthropic"):
         return normalise_anthropic_usage(usage)
-    return normalise_openai_usage(usage)
+    raise ValueError(f"unknown provider for usage normalisation: {provider_name!r}")
 
 
 async def _persist_model_calls(
@@ -97,10 +99,13 @@ async def _persist_model_calls(
 
 def _provider_error_payload(turn: Any, call_rows: list[HttpCallRecord]) -> dict[str, Any]:
     last = call_rows[-1] if call_rows else None
+    status = last.http_status if last is not None else turn.http_status
+    request_id = turn.request_id or (last.request_id if last else None)
+    error_body = turn.error_body or (last.error_body if last else "")
     return {
-        "http_status": turn.http_status,
-        "request_id": turn.request_id or (last.request_id if last else None),
-        "error_body": turn.error_body or (last.error_body if last else ""),
+        "http_status": status,
+        "request_id": request_id,
+        "error_body": error_body,
     }
 
 
@@ -240,6 +245,19 @@ async def run_agent_loop(
                     call_rows=call_rows,
                     provider_name=provider_name,
                 )
+
+                if turn.finish_reason == "stream_interrupted":
+                    stop_reason = "provider_error"
+                    status = "failed"
+                    error_detail = _provider_error_payload(turn, call_rows)
+                    await events.append(
+                        run_id,
+                        step,
+                        "provider_error",
+                        time.time(),
+                        json.dumps(error_detail),
+                    )
+                    break
 
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
                 if turn.reasoning_content:

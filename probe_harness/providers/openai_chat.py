@@ -21,6 +21,7 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
+MAX_RETRY_AFTER_S = 60.0
 ERROR_BODY_MAX = 800
 
 _SENSITIVE_KEYS = frozenset({"authorization", "x-api-key", "api-key", "x-auth-token", "bearer"})
@@ -72,12 +73,24 @@ def _is_retryable_status(status: int) -> bool:
     return status == 429 or status >= 500
 
 
+class RetryAfterTooLarge(Exception):
+    """Retry-After header exceeds the allowed wait cap."""
+
+    def __init__(self, seconds: float, cap: float) -> None:
+        self.seconds = seconds
+        self.cap = cap
+        super().__init__(f"Retry-After {seconds}s exceeds maximum {cap}s")
+
+
 def _retry_sleep_seconds(resp: httpx.Response | None, attempt: int) -> float:
     if resp is not None:
         raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
         if raw:
             try:
-                return max(0.0, float(raw))
+                val = max(0.0, float(raw))
+                if val > MAX_RETRY_AFTER_S:
+                    raise RetryAfterTooLarge(val, MAX_RETRY_AFTER_S)
+                return val
             except ValueError:
                 pass
     idx = min(attempt - 1, len(RETRY_BACKOFF_S) - 1)
@@ -107,9 +120,10 @@ def assemble_stream_tool_calls(
         ToolCallSpec(
             id=item["id"],
             name=item["name"],
-            arguments=item["arguments"] or "{}",
+            arguments=item["arguments"],
         )
         for item in ordered
+        if item["id"] or item["name"] or item["arguments"]
     ]
 
 
@@ -395,37 +409,25 @@ class OpenAIChatProvider:
 
         if stream_result.stream_error is not None:
             err_body = error_body_from_text(str(stream_result.stream_error))
-            turn = ModelTurn(
-                content=None,
-                finish_reason="error",
-                http_status=resp.status_code,
-                error_body=err_body,
-            )
             usage_raw = {}
             if stream_result.lines and received:
-                parsed_turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
-                turn.content = parsed_turn.content
-                turn.tool_calls = parsed_turn.tool_calls
-                turn.reasoning_content = parsed_turn.reasoning_content
-                turn.usage = usage_raw
-                turn.finish_reason = "stream_interrupted"
+                _parsed, usage_raw = parse_sse_stream_payload(stream_result.lines)
             finish = "stream_interrupted"
-            if usage_raw:
-                try:
-                    self._record_response_usage(
-                        usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
-                    )
-                except TokenCapReached as cap:
-                    record = self._http_call_record(
-                        attempt,
-                        usage_raw,
-                        resp,
-                        latency_ms,
-                        finish,
-                        error_body=err_body,
-                    )
-                    cap.pending_record = record  # type: ignore[attr-defined]
-                    raise
+            try:
+                self._record_response_usage(
+                    usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
+                )
+            except TokenCapReached as cap:
+                record = self._http_call_record(
+                    attempt,
+                    usage_raw,
+                    resp,
+                    latency_ms,
+                    finish,
+                    error_body=err_body,
+                )
+                cap.pending_record = record  # type: ignore[attr-defined]
+                raise
             record = self._http_call_record(
                 attempt,
                 usage_raw,
@@ -434,8 +436,16 @@ class OpenAIChatProvider:
                 finish,
                 error_body=err_body,
             )
-            turn.latency_ms = latency_ms
-            turn.request_id = _request_id(resp)
+            turn = ModelTurn(
+                content=None,
+                tool_calls=[],
+                finish_reason="stream_interrupted",
+                usage=usage_raw,
+                http_status=resp.status_code,
+                request_id=_request_id(resp),
+                latency_ms=latency_ms,
+                error_body=err_body,
+            )
             should_retry = not received
             return turn, record, should_retry, resp
 
@@ -503,7 +513,7 @@ class OpenAIChatProvider:
         url = f"{self.base_url}/chat/completions"
         client = await self._get_client()
         http_calls: list[HttpCallRecord] = []
-        turn = ModelTurn(content=None, finish_reason="error")
+        turn = ModelTurn(content=None, finish_reason="error", http_status=0)
 
         for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
             try:
@@ -552,7 +562,14 @@ class OpenAIChatProvider:
                 )
                 http_calls.append(record)
                 if attempt >= MAX_RETRY_ATTEMPTS:
-                    raise ProviderCallError(str(exc), http_calls=http_calls, turn=turn) from exc
+                    err_turn = ModelTurn(
+                        content=None,
+                        finish_reason="error",
+                        http_status=record.http_status,
+                        request_id=record.request_id,
+                        error_body=record.error_body,
+                    )
+                    raise ProviderCallError(str(exc), http_calls=http_calls, turn=err_turn) from exc
                 should_retry = True
                 retry_resp = None
             else:
@@ -563,7 +580,17 @@ class OpenAIChatProvider:
                     return turn, http_calls
 
             if attempt < MAX_RETRY_ATTEMPTS and should_retry:
-                await asyncio.sleep(_retry_sleep_seconds(retry_resp, attempt))
+                try:
+                    sleep_s = _retry_sleep_seconds(retry_resp, attempt)
+                except RetryAfterTooLarge as exc:
+                    err_turn = ModelTurn(
+                        content=None,
+                        finish_reason="error",
+                        http_status=0,
+                        error_body=str(exc)[:ERROR_BODY_MAX],
+                    )
+                    raise ProviderCallError(str(exc), http_calls=http_calls, turn=err_turn) from exc
+                await asyncio.sleep(sleep_s)
                 continue
 
             turn.http_calls = http_calls
