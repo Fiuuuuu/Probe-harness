@@ -14,7 +14,7 @@ from typing import Any
 import httpx
 
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError, ToolCallSpec
-from probe_harness.providers.guards import merge_system_messages_openai
+from probe_harness.providers.guards import merge_system_messages_openai, strip_reasoning_for_wire
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
@@ -142,6 +142,7 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
     finish_reason = "stop"
     http_status = 200
     response_model: str | None = None
+    request_id: str | None = None
 
     for line in lines:
         line = line.strip()
@@ -156,6 +157,8 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
             continue
         if chunk.get("model"):
             response_model = str(chunk["model"])
+        if chunk.get("id") and request_id is None:
+            request_id = str(chunk["id"])
         if chunk.get("usage"):
             usage_raw = chunk["usage"]
         for choice in chunk.get("choices") or []:
@@ -179,6 +182,7 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
         usage=usage_raw,
         http_status=http_status,
         response_model=response_model,
+        request_id=request_id,
     )
     return turn, usage_raw
 
@@ -237,7 +241,10 @@ class OpenAIChatProvider:
         stream: bool,
     ) -> dict[str, Any]:
         thinking_param = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
-        wire_messages = merge_system_messages_openai(messages)
+        wire_messages = strip_reasoning_for_wire(
+            merge_system_messages_openai(messages),
+            thinking_enabled=thinking_enabled,
+        )
         body: dict[str, Any] = {
             "model": self.model,
             "messages": wire_messages,
@@ -286,12 +293,13 @@ class OpenAIChatProvider:
         error_body: str = "",
         usage_estimated: bool = False,
         response_model: str | None = None,
+        request_id: str | None = None,
     ) -> HttpCallRecord:
         return HttpCallRecord(
             attempt=attempt,
             usage=usage_raw,
             http_status=resp.status_code,
-            request_id=_request_id(resp, None),
+            request_id=request_id if request_id is not None else _request_id(resp, None),
             latency_ms=latency_ms,
             stop_reason=finish_reason,
             error_body=error_body,
@@ -377,6 +385,7 @@ class OpenAIChatProvider:
             finish = choice.get("finish_reason") or "stop"
 
         resp_model = str(data["model"]) if resp.status_code < 400 and data.get("model") else None
+        rid = _request_id(resp, data if data else None)
         record = self._http_call_record(
             attempt,
             usage_raw,
@@ -385,6 +394,7 @@ class OpenAIChatProvider:
             finish,
             error_body=err_body,
             response_model=resp_model,
+            request_id=rid,
         )
         try:
             self._record_response_usage(
@@ -397,6 +407,7 @@ class OpenAIChatProvider:
         if resp.status_code < 400:
             turn = self._turn_from_json(data, resp, latency_ms)
             record.response_model = turn.response_model
+            record.request_id = turn.request_id
             return turn, record, False, resp
 
         should_retry = _is_retryable_status(resp.status_code)
@@ -435,7 +446,10 @@ class OpenAIChatProvider:
             err_body = error_body_from_text(str(stream_result.stream_error))
             usage_raw = {}
             if stream_result.lines and received:
-                _parsed, usage_raw = parse_sse_stream_payload(stream_result.lines)
+                parsed_turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
+                stream_rid = parsed_turn.request_id
+            else:
+                stream_rid = None
             finish = "stream_interrupted"
             estimated_usage = usage_raw
             usage_estimated = False
@@ -458,6 +472,7 @@ class OpenAIChatProvider:
                     finish,
                     error_body=err_body,
                     usage_estimated=usage_estimated,
+                    request_id=stream_rid or _request_id(resp),
                 )
                 cap.pending_record = record  # type: ignore[attr-defined]
                 raise
@@ -469,6 +484,7 @@ class OpenAIChatProvider:
                 finish,
                 error_body=err_body,
                 usage_estimated=usage_estimated,
+                request_id=stream_rid or _request_id(resp),
             )
             turn = ModelTurn(
                 content=None,
@@ -476,7 +492,7 @@ class OpenAIChatProvider:
                 finish_reason="stream_interrupted",
                 usage=estimated_usage,
                 http_status=resp.status_code,
-                request_id=_request_id(resp),
+                request_id=stream_rid or _request_id(resp),
                 latency_ms=latency_ms,
                 error_body=err_body,
             )
@@ -486,7 +502,7 @@ class OpenAIChatProvider:
         if resp.status_code < 400:
             turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
             turn.latency_ms = latency_ms
-            turn.request_id = _request_id(resp)
+            turn.request_id = turn.request_id or _request_id(resp)
             turn.http_status = resp.status_code
             finish = turn.finish_reason
             usage_estimated = False
@@ -505,6 +521,7 @@ class OpenAIChatProvider:
                 finish,
                 response_model=turn.response_model,
                 usage_estimated=usage_estimated,
+                request_id=turn.request_id,
             )
             try:
                 self._record_response_usage(
@@ -535,6 +552,7 @@ class OpenAIChatProvider:
             finish,
             error_body=err_body,
             response_model=str(err_data["model"]) if err_data.get("model") else None,
+            request_id=_request_id(resp, err_data or None),
         )
         turn = ModelTurn(
             content=None,

@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from probe_harness.core.context import prepare_context
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
-from probe_harness.providers.guards import is_truncated_turn
+from probe_harness.providers.guards import is_truncated_turn, scrub_message_for_storage
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
 from probe_harness.providers.usage import (
@@ -80,8 +80,8 @@ async def _persist_model_calls(
             INSERT INTO model_calls (
                 run_id, step, attempt, input_total, cached_read, cache_write,
                 uncached, output, reasoning, stop_reason, latency_ms,
-                request_sha256, http_status, request_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_sha256, http_status, request_id, response_model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -98,6 +98,7 @@ async def _persist_model_calls(
                 req_hash,
                 call_row.http_status,
                 call_row.request_id,
+                call_row.response_model or turn.response_model,
             ),
         )
 
@@ -279,7 +280,7 @@ async def run_agent_loop(
                     store,
                     run_id=run_id,
                     step=step,
-                    model=turn.response_model or model,
+                    model=model,
                     messages=provider_messages,
                     max_tok=max_tok,
                     turn=turn,
@@ -300,7 +301,9 @@ async def run_agent_loop(
                     )
                     break
 
-                assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
+                assistant_msg: dict[str, Any] = scrub_message_for_storage(
+                    {"role": "assistant", "content": turn.content}
+                )
                 if turn.reasoning_content:
                     assistant_msg["reasoning_content"] = turn.reasoning_content
                 if turn.tool_calls:
@@ -317,6 +320,8 @@ async def run_agent_loop(
                 resp_payload = {
                     "finish_reason": turn.finish_reason,
                     "tool_calls": len(turn.tool_calls),
+                    "response_model": turn.response_model,
+                    "request_id": turn.request_id,
                 }
                 await events.append(
                     run_id,
@@ -343,12 +348,17 @@ async def run_agent_loop(
                     stop_reason = turn.finish_reason or "stop"
                     break
 
-                if is_truncated_turn(
-                    turn.tool_calls,
-                    finish_reason=turn.finish_reason,
-                    max_tokens=max_tok,
-                    usage=turn.usage,
-                ):
+                truncated = bool(turn.tool_calls) and (
+                    turn.finish_reason in {"length", "max_tokens"}
+                    or is_truncated_turn(
+                        turn.tool_calls,
+                        finish_reason=turn.finish_reason,
+                        max_tokens=max_tok,
+                        usage=turn.usage,
+                        provider_name=provider_name,
+                    )
+                )
+                if truncated:
                     for tc in turn.tool_calls:
                         payload = json.dumps(
                             {
@@ -381,6 +391,24 @@ async def run_agent_loop(
                     step += 1
                     continue
 
+                if task.get("simulate_interrupt_before_tool_results"):
+                    step += 1
+                    continue
+
+                if task.get("simulate_interrupt_before_approval"):
+                    await events.append(
+                        run_id,
+                        step,
+                        "approval_requested",
+                        time.time(),
+                        json.dumps(
+                            {"call_id": turn.tool_calls[0].id, "simulated": True},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    step += 1
+                    continue
+
                 for tc in turn.tool_calls:
                     raw_name = denormalise_tool_name(tc.name, name_map=name_map)
                     norm = normalise_tool_name(raw_name, name_map=name_map)
@@ -393,7 +421,10 @@ async def run_agent_loop(
                         json.dumps({"call_id": tc.id, "name": norm}),
                     )
                     try:
-                        result, exit_code, duration_ms = await execute_tool(norm, tc.arguments)
+                        result, exit_code, duration_ms = await execute_tool(
+                            raw_name,
+                            tc.arguments,
+                        )
                     except Exception as exc:
                         result = {"error": f"tool execution failed: {exc}", "is_error": True}
                         exit_code = 1

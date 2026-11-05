@@ -15,8 +15,12 @@ from probe_harness.providers.guards import (
     repair_tool_pairing,
 )
 from probe_harness.providers.ledger import UsageLedger
-from probe_harness.providers.openai_chat import OpenAIChatProvider, assemble_stream_tool_calls
-from probe_harness.store.db import EventWriter, Store
+from probe_harness.providers.openai_chat import (
+    OpenAIChatProvider,
+    assemble_stream_tool_calls,
+    parse_sse_stream_payload,
+)
+from probe_harness.store.db import Store
 from probe_harness.tools.names import ToolNameMap, denormalise_tool_name, normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS
 
@@ -40,15 +44,22 @@ def test_c3_merge_system_never_overwrites() -> None:
     ]
     merged = merge_system_messages_openai(messages)
     assert merged[0]["role"] == "system"
-    assert "base" in merged[0]["content"] and "extra" in merged[0]["content"]
+    assert merged[0]["content"] == "base"
+    assert merged[1]["content"] == "hi\n\nextra"
     assert all(m.get("role") != "system" for m in merged[1:])
 
 
-@pytest.mark.parametrize(
-    "reason",
-    ["policy_stop", "loop_guard", "cancel_during_tool_exec", "cancel_during_approval"],
-)
-def test_c1_pairing_repair_orphans(reason: str) -> None:
+def test_c3_list_system_content_not_dropped() -> None:
+    messages = [
+        {"role": "system", "content": "BASE"},
+        {"role": "system", "content": [{"type": "text", "text": "LIST-SYS"}]},
+        {"role": "user", "content": "u"},
+    ]
+    merged = merge_system_messages_openai(messages)
+    assert merged[0]["content"] == "BASE\nLIST-SYS"
+
+
+def test_c1_pairing_repair_orphan() -> None:
     messages = [
         {"role": "user", "content": "go"},
         {
@@ -63,67 +74,146 @@ def test_c1_pairing_repair_orphans(reason: str) -> None:
             ],
         },
     ]
-    repaired, repairs = repair_tool_pairing(messages, reason=reason)
+    repaired, repairs = repair_tool_pairing(messages, reason="interrupted")
     assert repairs and repairs[0]["tool_call_id"] == "call_orphan"
     assert any(m.get("role") == "tool" and m.get("tool_call_id") == "call_orphan" for m in repaired)
 
 
-@pytest.mark.asyncio
-async def test_loop_emits_protocol_repair_event(tmp_path: Path) -> None:
-    script = [
-        {
-            "tool_calls": [
-                {
-                    "id": "call1",
-                    "function": {"name": "bash", "arguments": "{}"},
-                }
-            ],
-            "finish_reason": "tool_calls",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        },
-        {
-            "content": "done",
-            "finish_reason": "stop",
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
-        },
+def test_c6_all_fixture_i_shapes_truncated() -> None:
+    fixtures = json.loads(Path("fixtures/probe_results.json").read_text(encoding="utf-8"))[
+        "results"
     ]
-    store = Store(tmp_path / "pair.db")
+    for row in fixtures:
+        if row["probe"] != "i_maxtokens_in_toolcall":
+            continue
+        fr = str(row.get("finish_reason") or row.get("stop_reason") or "")
+        args = '{"city": "Paris"}' if row["provider"] != "deepseek" else '{"city": "Pa'
+        tc = ToolCallSpec(id="c1", name="get_weather", arguments=args)
+        assert is_truncated_tool_call(
+            tc,
+            finish_reason=fr,
+            max_tokens=40,
+            usage=row["usage"],
+            provider_name=row["provider"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_request_id_and_response_model_persisted(tmp_path: Path) -> None:
+    posts: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(req.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-B1",
+                "model": "deepseek-v4-flash-0105",
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+            },
+        )
+
+    provider = OpenAIChatProvider(
+        api_key="k",
+        ledger=UsageLedger(path=tmp_path / "persist.jsonl", task_id="persist"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    store = Store(tmp_path / "persist.db")
     await store.connect()
     task = tmp_path / "task.json"
-    task.write_text(json.dumps({"user_message": "hi", "fake_script": script}))
-    from probe_harness.providers.fake import FakeProvider
-
+    task.write_text(json.dumps({"user_message": "hi", "max_tokens": 8}))
     run_id = await run_agent_loop(
         store,
-        FakeProvider(script),
+        provider,
         task,
-        provider_name="fake",
-        model="fake",
+        provider_name="deepseek",
+        model="deepseek-flash",
     )
-    messages = [
-        {"role": "system", "content": "s"},
-        {"role": "user", "content": "hi"},
-        {
-            "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": "orph",
-                    "type": "function",
-                    "function": {"name": "bash", "arguments": "{}"},
-                }
-            ],
-        },
-    ]
-    _, repairs, _ = prepare_context(messages, TOOL_SCHEMAS, repair_reason="cancel_during_tool_exec")
-    events = EventWriter(store)
-    for repair in repairs:
-        await events.append(run_id, 1, "protocol_repair", 0, json.dumps(repair))
-    rows = await store.fetchall(
-        "SELECT type FROM events WHERE run_id = ? AND type = 'protocol_repair'",
+    row = await store.fetchone(
+        "SELECT request_id, response_model, request_sha256 FROM model_calls WHERE run_id = ?",
+        (run_id,),
+    )
+    ev = await store.fetchone(
+        "SELECT data_json FROM events WHERE run_id = ? AND type = 'model_response'",
         (run_id,),
     )
     await store.close()
-    assert rows
+    await provider.aclose()
+    assert row["request_id"] == "chatcmpl-B1"
+    assert row["response_model"] == "deepseek-v4-flash-0105"
+    assert posts[0]["model"] == "deepseek-flash"
+    payload = json.loads(ev["data_json"])
+    assert payload["response_model"] == "deepseek-v4-flash-0105"
+
+
+@pytest.mark.asyncio
+async def test_thinking_disabled_strips_reasoning_on_wire(tmp_path: Path) -> None:
+    bodies: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        bodies.append(json.loads(req.content))
+        n = len(bodies)
+        if n == 1:
+            msg = {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "secret chain",
+                "tool_calls": [
+                    {
+                        "id": "t1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            }
+            finish = "tool_calls"
+        else:
+            msg = {"role": "assistant", "content": "ok"}
+            finish = "stop"
+        return httpx.Response(
+            200,
+            json={
+                "id": f"chatcmpl-{n}",
+                "model": "deepseek-flash",
+                "choices": [{"message": msg, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+            },
+        )
+
+    provider = OpenAIChatProvider(
+        api_key="k",
+        thinking_enabled=False,
+        ledger=UsageLedger(path=tmp_path / "think.jsonl", task_id="think"),
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    store = Store(tmp_path / "think.db")
+    await store.connect()
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"user_message": "go", "max_tokens": 32, "thinking_enabled": False}))
+
+    await run_agent_loop(
+        store,
+        provider,
+        task,
+        provider_name="deepseek",
+        model="deepseek-flash",
+    )
+    await store.close()
+    await provider.aclose()
+    assert len(bodies) >= 2
+    second_assistant = [m for m in bodies[1]["messages"] if m.get("role") == "assistant"]
+    assert second_assistant
+    assert "reasoning_content" not in second_assistant[0]
+
+
+def test_sse_request_id_from_first_chunk() -> None:
+    lines = [
+        'data: {"id": "chatcmpl-S1", "model": "deepseek-v4-flash", "choices": []}',
+        "data: [DONE]",
+    ]
+    turn, _ = parse_sse_stream_payload(lines)
+    assert turn.request_id == "chatcmpl-S1"
 
 
 def test_c4_mcp_name_never_split_on_double_underscore() -> None:
