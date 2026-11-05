@@ -10,7 +10,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.core.context import prepare_context
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
+from probe_harness.providers.guards import is_truncated_turn
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
 from probe_harness.providers.usage import (
@@ -19,7 +21,7 @@ from probe_harness.providers.usage import (
     normalise_openai_usage,
 )
 from probe_harness.store.db import EventWriter, Store
-from probe_harness.tools.names import normalise_tool_name
+from probe_harness.tools.names import ToolNameMap, denormalise_tool_name, normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS, execute_tool
 
 
@@ -70,6 +72,9 @@ async def _persist_model_calls(
     req_hash = request_sha256(req_body)
     for call_row in call_rows:
         row_usage = _normalise_usage(provider_name, call_row.usage)
+        stop = call_row.stop_reason or turn.finish_reason
+        if call_row.usage_estimated:
+            stop = f"{stop}|usage_estimated"
         await store.execute(
             """
             INSERT INTO model_calls (
@@ -88,7 +93,7 @@ async def _persist_model_calls(
                 row_usage["uncached"],
                 row_usage["output"],
                 row_usage["reasoning"],
-                call_row.stop_reason or turn.finish_reason,
+                stop,
                 call_row.latency_ms,
                 req_hash,
                 call_row.http_status,
@@ -189,6 +194,8 @@ async def run_agent_loop(
     ]
 
     script = task.get("fake_script") or []
+    name_map = ToolNameMap()
+    thinking_enabled = task.get("thinking_enabled")
     if provider_name == "fake" and script:
         from probe_harness.providers.fake import FakeProvider
 
@@ -204,23 +211,57 @@ async def run_agent_loop(
     try:
         while step < max_steps:
             try:
+                provider_messages, repairs, api_tools = prepare_context(
+                    messages,
+                    TOOL_SCHEMAS,
+                    repair_reason=task.get("pairing_repair_reason", "interrupted"),
+                    name_map=name_map,
+                )
+                for repair in repairs:
+                    await events.append(
+                        run_id,
+                        step,
+                        "protocol_repair",
+                        time.time(),
+                        json.dumps(repair, ensure_ascii=False),
+                    )
+
+                await events.append(
+                    run_id,
+                    step,
+                    "context_prepared",
+                    time.time(),
+                    json.dumps(
+                        {
+                            "step": step,
+                            "message_count": len(provider_messages),
+                            "repairs": len(repairs),
+                        }
+                    ),
+                )
+
                 await events.append(
                     run_id,
                     step,
                     "model_request",
                     time.time(),
-                    json.dumps({"step": step, "message_count": len(messages)}),
+                    json.dumps({"step": step, "message_count": len(provider_messages)}),
                 )
 
                 max_tok = task.get("max_tokens", 8192)
-                est_in = estimate_chat_input_tokens(messages, TOOL_SCHEMAS)
+                est_in = estimate_chat_input_tokens(provider_messages, api_tools)
                 use_stream = bool(task.get("stream", False)) and provider_name == "deepseek"
+                complete_kwargs: dict[str, Any] = {
+                    "max_tokens": max_tok,
+                    "estimated_input_tokens": est_in,
+                    "stream": use_stream,
+                }
+                if thinking_enabled is not None:
+                    complete_kwargs["thinking_enabled"] = bool(thinking_enabled)
                 turn = await provider.complete(
-                    messages,
-                    tools=TOOL_SCHEMAS,
-                    max_tokens=max_tok,
-                    estimated_input_tokens=est_in,
-                    stream=use_stream,
+                    provider_messages,
+                    tools=api_tools,
+                    **complete_kwargs,
                 )
 
                 call_rows = turn.http_calls or [
@@ -238,8 +279,8 @@ async def run_agent_loop(
                     store,
                     run_id=run_id,
                     step=step,
-                    model=model,
-                    messages=messages,
+                    model=turn.response_model or model,
+                    messages=provider_messages,
                     max_tok=max_tok,
                     turn=turn,
                     call_rows=call_rows,
@@ -302,8 +343,47 @@ async def run_agent_loop(
                     stop_reason = turn.finish_reason or "stop"
                     break
 
+                if is_truncated_turn(
+                    turn.tool_calls,
+                    finish_reason=turn.finish_reason,
+                    max_tokens=max_tok,
+                    usage=turn.usage,
+                ):
+                    for tc in turn.tool_calls:
+                        payload = json.dumps(
+                            {
+                                "error": "tool call truncated: incomplete arguments",
+                                "is_error": True,
+                                "truncated": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": payload,
+                            }
+                        )
+                        await events.append(
+                            run_id,
+                            step,
+                            "protocol_repair",
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "kind": "truncation",
+                                    "tool_call_id": tc.id,
+                                    "finish_reason": turn.finish_reason,
+                                }
+                            ),
+                        )
+                    step += 1
+                    continue
+
                 for tc in turn.tool_calls:
-                    norm = normalise_tool_name(tc.name)
+                    raw_name = denormalise_tool_name(tc.name, name_map=name_map)
+                    norm = normalise_tool_name(raw_name, name_map=name_map)
                     args_sha = hashlib.sha256(tc.arguments.encode()).hexdigest()
                     await events.append(
                         run_id,
@@ -331,7 +411,7 @@ async def run_agent_loop(
                             run_id,
                             step,
                             tc.id,
-                            tc.name,
+                            raw_name,
                             norm,
                             args_sha,
                             "ok" if exit_code == 0 else "error",
