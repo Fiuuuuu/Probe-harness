@@ -12,17 +12,17 @@ from probe_harness.providers.guards import repair_tool_pairing
 from probe_harness.providers.ledger import UsageLedger
 from probe_harness.providers.openai_chat import OpenAIChatProvider
 from probe_harness.store.db import Store
-from probe_harness.tools.names import ToolNameMap, normalise_tool_name, normalise_tool_schemas
+from probe_harness.tools.names import ToolNameMap, normalise_tool_name
 
 pytestmark = [pytest.mark.live]
 
 
-def _weather_tools() -> list[dict]:
+def _weather_tool_schema(name: str = "get_weather") -> list[dict]:
     return [
         {
             "type": "function",
             "function": {
-                "name": "get_weather",
+                "name": name,
                 "description": "Get weather for a city",
                 "parameters": {
                     "type": "object",
@@ -32,6 +32,23 @@ def _weather_tools() -> list[dict]:
             },
         }
     ]
+
+
+def _tool_choice(name: str = "get_weather") -> dict:
+    return {"type": "function", "function": {"name": name}}
+
+
+def _reasoning_diag(provider: OpenAIChatProvider, turn) -> str:
+    usage = turn.usage or {}
+    details = usage.get("completion_tokens_details") or {}
+    msg = provider.last_assistant_message or {}
+    return (
+        f"reasoning_tokens={details.get('reasoning_tokens')} "
+        f"message_keys={sorted(msg.keys())} "
+        f"finish_reason={turn.finish_reason} "
+        f"response_model={turn.response_model} "
+        f"reasoning_content_present={bool(turn.reasoning_content)}"
+    )
 
 
 def _broken_histories() -> dict[str, list[dict]]:
@@ -101,7 +118,7 @@ async def test_live_pairing_repair_cases() -> None:
         thinking_enabled=False,
         test_run_id="live-pairing",
     )
-    tools = _weather_tools()
+    tools = _weather_tool_schema()
     histories = _broken_histories()
     for name, broken in histories.items():
         bad = await provider.complete(
@@ -133,20 +150,7 @@ async def test_live_tool_name_normalisation() -> None:
     )
     mapper = ToolNameMap()
     raw_bad = "mcp.server/tool"
-    bad_schema = [
-        {
-            "type": "function",
-            "function": {
-                "name": raw_bad,
-                "description": "x",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"city": {"type": "string"}},
-                    "required": ["city"],
-                },
-            },
-        }
-    ]
+    bad_schema = _weather_tool_schema(raw_bad)
     bad = await provider.complete(
         [{"role": "user", "content": "call tool"}],
         tools=bad_schema,
@@ -156,27 +160,30 @@ async def test_live_tool_name_normalisation() -> None:
     assert bad.http_status == 400
 
     norm = normalise_tool_name(raw_bad, name_map=mapper)
-    norm_schema = normalise_tool_schemas(_weather_tools(), name_map=mapper)
+    norm_schema = _weather_tool_schema(norm)
     ok_norm = await provider.complete(
-        [{"role": "user", "content": f"use {norm} for Paris"}],
+        [{"role": "user", "content": "Weather in Paris."}],
         tools=norm_schema,
         max_tokens=64,
         thinking_enabled=False,
+        tool_choice=_tool_choice(norm),
     )
     assert ok_norm.http_status == 200
+    assert provider.last_request_bodies[-1]["tools"][0]["function"]["name"] == norm
 
     long70 = "w" * 70
     norm70 = normalise_tool_name(long70, name_map=mapper)
-    schema70 = normalise_tool_schemas(_weather_tools(), name_map=mapper)
-    schema70[0]["function"]["name"] = norm70
+    schema70 = _weather_tool_schema(norm70)
     ok70 = await provider.complete(
-        [{"role": "user", "content": "weather"}],
+        [{"role": "user", "content": "Weather in Paris."}],
         tools=schema70,
         max_tokens=64,
         thinking_enabled=False,
+        tool_choice=_tool_choice(norm70),
     )
     await provider.aclose()
     assert ok70.http_status == 200
+    assert provider.last_request_bodies[-1]["tools"][0]["function"]["name"] == norm70
 
 
 @pytest.mark.asyncio
@@ -187,19 +194,33 @@ async def test_live_thinking_tools_reasoning_replay_two_rounds() -> None:
         thinking_enabled=True,
         test_run_id="live-reasoning",
     )
-    tools = _weather_tools()
+    tools = _weather_tool_schema()
+    q = (
+        "First compute 37*43 and 29*53 and decide which is larger "
+        "(think it through briefly), then call get_weather for Paris."
+    )
     first = await provider.complete(
-        [{"role": "user", "content": "Weather in Tokyo? Must use get_weather."}],
+        [{"role": "user", "content": q}],
         tools=tools,
-        max_tokens=256,
+        max_tokens=512,
         thinking_enabled=True,
     )
-    assert first.http_status == 200 and first.tool_calls
-    if not first.reasoning_content:
-        pytest.skip("live model returned empty reasoning_content on tool turn")
+    for attempt in range(3):
+        if first.http_status == 200 and first.tool_calls and first.reasoning_content:
+            break
+        if attempt >= 2:
+            break
+        first = await provider.complete(
+            [{"role": "user", "content": q}],
+            tools=tools,
+            max_tokens=512,
+            thinking_enabled=True,
+        )
+    assert first.http_status == 200 and first.tool_calls, _reasoning_diag(provider, first)
+    assert first.reasoning_content, _reasoning_diag(provider, first)
 
-    history = [
-        {"role": "user", "content": "Weather in Tokyo? Must use get_weather."},
+    history: list[dict] = [
+        {"role": "user", "content": q},
         {
             "role": "assistant",
             "content": first.content or "",
@@ -222,59 +243,113 @@ async def test_live_thinking_tools_reasoning_replay_two_rounds() -> None:
         },
     ]
     second = await provider.complete(
-        history + [{"role": "user", "content": "Now Paris with get_weather."}],
+        history + [{"role": "user", "content": "Now call get_weather for Tokyo."}],
+        tools=tools,
+        max_tokens=512,
+        thinking_enabled=True,
+    )
+    for attempt in range(3):
+        if second.http_status == 200 and second.tool_calls and second.reasoning_content:
+            break
+        if attempt >= 2:
+            break
+        second = await provider.complete(
+            history + [{"role": "user", "content": "Now call get_weather for Tokyo."}],
+            tools=tools,
+            max_tokens=512,
+            thinking_enabled=True,
+        )
+    assert second.http_status == 200 and second.tool_calls, _reasoning_diag(provider, second)
+    assert second.reasoning_content, _reasoning_diag(provider, second)
+    history.extend(
+        [
+            {"role": "user", "content": "Now call get_weather for Tokyo."},
+            {
+                "role": "assistant",
+                "content": second.content or "",
+                "reasoning_content": second.reasoning_content,
+                "tool_calls": [
+                    {
+                        "id": second.tool_calls[0].id,
+                        "type": "function",
+                        "function": {
+                            "name": second.tool_calls[0].name,
+                            "arguments": second.tool_calls[0].arguments,
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": second.tool_calls[0].id,
+                "content": json.dumps({"temp_c": 18}),
+            },
+        ]
+    )
+
+    summarize = [{"role": "user", "content": "Summarize both cities in one sentence."}]
+    good = await provider.complete(
+        history + summarize,
         tools=tools,
         max_tokens=256,
         thinking_enabled=True,
     )
-    assert second.http_status == 200
-    if not second.tool_calls:
-        pytest.skip("model did not issue second tool call")
-    history.append(
-        {
-            "role": "assistant",
-            "content": second.content or "",
-            "reasoning_content": second.reasoning_content or "",
-            "tool_calls": [
-                {
-                    "id": second.tool_calls[0].id,
-                    "type": "function",
-                    "function": {
-                        "name": second.tool_calls[0].name,
-                        "arguments": second.tool_calls[0].arguments,
-                    },
-                }
-            ],
-        }
-    )
-    history.append(
-        {
-            "role": "tool",
-            "tool_call_id": second.tool_calls[0].id,
-            "content": json.dumps({"temp_c": 18}),
-        }
-    )
+    assert good.http_status == 200, _reasoning_diag(provider, good)
 
     stripped = json.loads(json.dumps(history))
     for msg in stripped:
         if msg.get("role") == "assistant":
             msg.pop("reasoning_content", None)
     bad = await provider.complete(
-        stripped + [{"role": "user", "content": "Summarize both cities."}],
+        stripped + summarize,
         tools=tools,
         max_tokens=256,
         thinking_enabled=True,
     )
-    assert bad.http_status == 400
+    assert bad.http_status == 400, _reasoning_diag(provider, bad)
 
-    good = await provider.complete(
-        history + [{"role": "user", "content": "Summarize both cities."}],
+    # fixtures g7/g9: explicit thinking + tool turn without reasoning_content → 400
+    g7_tc = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_00_x",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Paris"}',
+                },
+            }
+        ],
+    }
+    g7_msgs = [
+        {"role": "user", "content": "Weather in Paris?"},
+        g7_tc,
+        {"role": "tool", "tool_call_id": "call_00_x", "content": "18C sunny"},
+    ]
+    g7_bad = await provider.complete(
+        g7_msgs,
+        tools=tools,
+        max_tokens=256,
+        thinking_enabled=True,
+    )
+    assert g7_bad.http_status == 400
+
+    g9_tc = dict(g7_tc)
+    g9_tc["reasoning_content"] = "I should call get_weather for Paris."
+    g9_good = await provider.complete(
+        [
+            {"role": "user", "content": "Weather in Paris?"},
+            g9_tc,
+            {"role": "tool", "tool_call_id": "call_00_x", "content": "18C sunny"},
+        ],
         tools=tools,
         max_tokens=256,
         thinking_enabled=True,
     )
     await provider.aclose()
-    assert good.http_status == 200
+    assert g9_good.http_status == 200
 
 
 @pytest.mark.asyncio
@@ -289,10 +364,16 @@ async def test_live_truncation_through_loop(tmp_path: Path) -> None:
     task.write_text(
         json.dumps(
             {
-                "user_message": "Call get_weather; answer must use the tool.",
-                "max_tokens": 8,
-                "max_steps": 3,
+                "user_message": (
+                    "Use write_file to create poem.txt containing a 20-line poem about the sea. "
+                    "Call write_file immediately with a long content string."
+                ),
+                "max_tokens": 40,
+                "max_steps": 5,
                 "thinking_enabled": False,
+                "tool_choice": _tool_choice("write_file"),
+                "reject_length_without_tool_calls": True,
+                "max_length_empty_retries": 3,
             }
         )
     )
@@ -304,7 +385,7 @@ async def test_live_truncation_through_loop(tmp_path: Path) -> None:
         task,
         provider_name="deepseek",
         model="deepseek-flash",
-        max_steps=3,
+        max_steps=5,
     )
     tool_rows = await store.fetchall("SELECT * FROM tool_calls WHERE run_id = ?", (run_id,))
     repairs = await store.fetchall(
@@ -315,16 +396,18 @@ async def test_live_truncation_through_loop(tmp_path: Path) -> None:
         "SELECT data_json FROM events WHERE run_id = ? AND type = 'model_response'",
         (run_id,),
     )
+    run = await store.fetchone("SELECT status, stop_reason FROM runs WHERE id = ?", (run_id,))
     await store.close()
     await provider.aclose()
+
     assert len(tool_rows) == 0
-    trunc_repairs = any('"kind": "truncation"' in r["data_json"] for r in repairs)
-    length_finish = any(
-        json.loads(r["data_json"]).get("finish_reason") == "length" for r in model_responses
-    )
-    if not trunc_repairs and not length_finish:
-        pytest.skip("live model did not truncate tool call at max_tokens=8")
-    assert length_finish
-    assert len(tool_rows) == 0
-    if any(json.loads(r["data_json"]).get("tool_calls", 0) > 0 for r in model_responses):
-        assert trunc_repairs
+    trunc_events = [json.loads(r["data_json"]) for r in repairs if "truncation" in r["data_json"]]
+    assert trunc_events, f"run={run} responses={model_responses}"
+    length_rows = [
+        json.loads(r["data_json"])
+        for r in model_responses
+        if json.loads(r["data_json"]).get("finish_reason") == "length"
+    ]
+    assert length_rows, f"run={run} responses={model_responses}"
+    assert any(r.get("tool_calls", 0) > 0 for r in length_rows), length_rows
+    assert trunc_events[0].get("finish_reason") == "length"

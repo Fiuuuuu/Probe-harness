@@ -12,7 +12,7 @@ from typing import Any, Protocol
 
 from probe_harness.core.context import prepare_context
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
-from probe_harness.providers.guards import is_truncated_turn, scrub_message_for_storage
+from probe_harness.providers.guards import is_truncated_turn
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
 from probe_harness.providers.usage import (
@@ -259,23 +259,56 @@ async def run_agent_loop(
                 }
                 if thinking_enabled is not None:
                     complete_kwargs["thinking_enabled"] = bool(thinking_enabled)
-                turn = await provider.complete(
-                    provider_messages,
-                    tools=api_tools,
-                    **complete_kwargs,
-                )
+                if task.get("tool_choice") is not None:
+                    complete_kwargs["tool_choice"] = task.get("tool_choice")
 
-                call_rows = turn.http_calls or [
-                    HttpCallRecord(
-                        attempt=1,
-                        usage=turn.usage,
-                        http_status=turn.http_status,
-                        request_id=turn.request_id,
-                        latency_ms=turn.latency_ms,
-                        stop_reason=turn.finish_reason,
-                        error_body=turn.error_body,
+                empty_retries = 0
+                max_empty = int(task.get("max_length_empty_retries", 3))
+                turn = None
+                call_rows: list[HttpCallRecord] = []
+                while True:
+                    turn = await provider.complete(
+                        provider_messages,
+                        tools=api_tools,
+                        **complete_kwargs,
                     )
-                ]
+                    call_rows = turn.http_calls or [
+                        HttpCallRecord(
+                            attempt=1,
+                            usage=turn.usage,
+                            http_status=turn.http_status,
+                            request_id=turn.request_id,
+                            latency_ms=turn.latency_ms,
+                            stop_reason=turn.finish_reason,
+                            error_body=turn.error_body,
+                            response_model=turn.response_model,
+                        )
+                    ]
+                    reject_empty = bool(task.get("reject_length_without_tool_calls"))
+                    if reject_empty and turn.finish_reason == "length" and not turn.tool_calls:
+                        empty_retries += 1
+                        if empty_retries >= max_empty:
+                            stop_reason = "provider_error"
+                            status = "failed"
+                            error_detail = {
+                                "error": (
+                                    "length finish_reason without tool_calls after "
+                                    f"{max_empty} attempts"
+                                ),
+                                "finish_reason": turn.finish_reason,
+                            }
+                            await events.append(
+                                run_id,
+                                step,
+                                "provider_error",
+                                time.time(),
+                                json.dumps(error_detail),
+                            )
+                            break
+                        continue
+                    break
+
+                assert turn is not None
                 await _persist_model_calls(
                     store,
                     run_id=run_id,
@@ -287,6 +320,9 @@ async def run_agent_loop(
                     call_rows=call_rows,
                     provider_name=provider_name,
                 )
+
+                if status == "failed" and stop_reason == "provider_error":
+                    break
 
                 if turn.finish_reason == "stream_interrupted":
                     stop_reason = "provider_error"
@@ -301,11 +337,12 @@ async def run_agent_loop(
                     )
                     break
 
-                assistant_msg: dict[str, Any] = scrub_message_for_storage(
-                    {"role": "assistant", "content": turn.content}
-                )
+                assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
+                think_on = thinking_enabled if thinking_enabled is not None else False
                 if turn.reasoning_content:
                     assistant_msg["reasoning_content"] = turn.reasoning_content
+                elif think_on and turn.tool_calls:
+                    assistant_msg["reasoning_content"] = ""
                 if turn.tool_calls:
                     assistant_msg["tool_calls"] = [
                         {
@@ -391,11 +428,11 @@ async def run_agent_loop(
                     step += 1
                     continue
 
-                if task.get("simulate_interrupt_before_tool_results"):
+                if provider_name == "fake" and task.get("simulate_interrupt_before_tool_results"):
                     step += 1
                     continue
 
-                if task.get("simulate_interrupt_before_approval"):
+                if provider_name == "fake" and task.get("simulate_interrupt_before_approval"):
                     await events.append(
                         run_id,
                         step,

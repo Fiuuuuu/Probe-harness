@@ -14,7 +14,12 @@ from typing import Any
 import httpx
 
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError, ToolCallSpec
-from probe_harness.providers.guards import merge_system_messages_openai, strip_reasoning_for_wire
+from probe_harness.providers.guards import (
+    merge_system_messages_openai,
+    strip_reasoning_for_wire,
+    thinking_passback_error_body,
+    validate_thinking_reasoning_passback,
+)
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
@@ -46,6 +51,23 @@ def scrub_request_body(body: dict[str, Any]) -> dict[str, Any]:
         return value
 
     return scrub(body)
+
+
+_REDACTED_THINKING_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def extract_reasoning_content(message: dict[str, Any]) -> str | None:
+    """C5: normalise reasoning from DeepSeek / gateway message shapes."""
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        val = message.get(key)
+        if isinstance(val, str) and val:
+            return val
+    content = message.get("content")
+    if isinstance(content, str):
+        match = _REDACTED_THINKING_RE.search(content)
+        if match:
+            return match.group(1)
+    return None
 
 
 def request_sha256(body: dict[str, Any]) -> str:
@@ -174,6 +196,8 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
     tool_calls = assemble_stream_tool_calls(tool_deltas)
     content = "".join(content_parts) or None
     reasoning = "".join(reasoning_parts) or None
+    if not reasoning and content:
+        reasoning = extract_reasoning_content({"content": content})
     turn = ModelTurn(
         content=content,
         tool_calls=tool_calls,
@@ -220,6 +244,8 @@ class OpenAIChatProvider:
         self.test_run_id = test_run_id
         self._client = client
         self._owns_client = client is None
+        self.last_assistant_message: dict[str, Any] = {}
+        self.last_request_bodies: list[dict[str, Any]] = []
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -239,6 +265,7 @@ class OpenAIChatProvider:
         max_tokens: int,
         thinking_enabled: bool,
         stream: bool,
+        tool_choice: Any | None = None,
     ) -> dict[str, Any]:
         thinking_param = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
         wire_messages = strip_reasoning_for_wire(
@@ -256,6 +283,8 @@ class OpenAIChatProvider:
             body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         if stream:
             body["stream_options"] = {"include_usage": True}
         return body
@@ -682,6 +711,7 @@ class OpenAIChatProvider:
     ) -> ModelTurn:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
+        self.last_assistant_message = dict(message)
         finish = choice.get("finish_reason") or "stop"
         tool_calls: list[ToolCallSpec] = []
         for tc in message.get("tool_calls") or []:
@@ -701,7 +731,7 @@ class OpenAIChatProvider:
         return ModelTurn(
             content=message.get("content"),
             tool_calls=tool_calls,
-            reasoning_content=message.get("reasoning_content"),
+            reasoning_content=extract_reasoning_content(message),
             finish_reason=finish,
             usage=data.get("usage") or {},
             http_status=resp.status_code,
@@ -719,16 +749,30 @@ class OpenAIChatProvider:
         thinking_enabled: bool | None = None,
         estimated_input_tokens: int | None = None,
         stream: bool = False,
+        tool_choice: Any | None = None,
     ) -> ModelTurn:
         mtoks = max_tokens if max_tokens is not None else self.max_tokens
         think = self.thinking_enabled if thinking_enabled is None else thinking_enabled
+        passback_err = validate_thinking_reasoning_passback(messages, thinking_enabled=think)
+        if passback_err:
+            return ModelTurn(
+                content=None,
+                tool_calls=[],
+                reasoning_content=None,
+                finish_reason="error",
+                usage={},
+                http_status=400,
+                error_body=thinking_passback_error_body(passback_err),
+            )
         body = self.build_request_body(
             messages,
             tools,
             max_tokens=mtoks,
             thinking_enabled=think,
             stream=stream,
+            tool_choice=tool_choice,
         )
+        self.last_request_bodies.append(scrub_request_body(body))
         est_in = (
             estimated_input_tokens
             if estimated_input_tokens is not None
