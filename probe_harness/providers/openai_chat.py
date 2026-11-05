@@ -14,12 +14,7 @@ from typing import Any
 import httpx
 
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError, ToolCallSpec
-from probe_harness.providers.guards import (
-    merge_system_messages_openai,
-    strip_reasoning_for_wire,
-    thinking_passback_error_body,
-    validate_thinking_reasoning_passback,
-)
+from probe_harness.providers.guards import merge_system_messages_openai, strip_reasoning_for_wire
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
@@ -753,17 +748,6 @@ class OpenAIChatProvider:
     ) -> ModelTurn:
         mtoks = max_tokens if max_tokens is not None else self.max_tokens
         think = self.thinking_enabled if thinking_enabled is None else thinking_enabled
-        passback_err = validate_thinking_reasoning_passback(messages, thinking_enabled=think)
-        if passback_err:
-            return ModelTurn(
-                content=None,
-                tool_calls=[],
-                reasoning_content=None,
-                finish_reason="error",
-                usage={},
-                http_status=400,
-                error_body=thinking_passback_error_body(passback_err),
-            )
         body = self.build_request_body(
             messages,
             tools,

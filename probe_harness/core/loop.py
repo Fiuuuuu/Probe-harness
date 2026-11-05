@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -153,6 +154,14 @@ def _record_loop_exception(exc: BaseException) -> tuple[str, str, BaseException]
     return "failed", "exception", exc
 
 
+def _allow_task_test_controls(task_path: Path) -> bool:
+    """Task JSON knobs (tool_choice, reject_length_*) are for tests/live probes only."""
+    if os.environ.get("HARNESS_ALLOW_TEST_CONTROLS") == "1":
+        return True
+    resolved = str(task_path.resolve())
+    return "/tests/" in resolved or "/tmp/" in resolved or "pytest-" in resolved
+
+
 async def run_agent_loop(
     store: Store,
     provider: ChatProvider,
@@ -259,11 +268,12 @@ async def run_agent_loop(
                 }
                 if thinking_enabled is not None:
                     complete_kwargs["thinking_enabled"] = bool(thinking_enabled)
-                if task.get("tool_choice") is not None:
+                test_controls = _allow_task_test_controls(task_path)
+                if test_controls and task.get("tool_choice") is not None:
                     complete_kwargs["tool_choice"] = task.get("tool_choice")
 
                 empty_retries = 0
-                max_empty = int(task.get("max_length_empty_retries", 3))
+                max_empty = int(task.get("max_length_empty_retries", 3)) if test_controls else 0
                 turn = None
                 call_rows: list[HttpCallRecord] = []
                 while True:
@@ -284,7 +294,9 @@ async def run_agent_loop(
                             response_model=turn.response_model,
                         )
                     ]
-                    reject_empty = bool(task.get("reject_length_without_tool_calls"))
+                    reject_empty = test_controls and bool(
+                        task.get("reject_length_without_tool_calls")
+                    )
                     if reject_empty and turn.finish_reason == "length" and not turn.tool_calls:
                         empty_retries += 1
                         if empty_retries >= max_empty:
