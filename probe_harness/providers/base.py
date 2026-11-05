@@ -14,6 +14,18 @@ class ToolCallSpec:
 
 
 @dataclass
+class HttpCallRecord:
+    """One row in model_calls — one HTTP request to the provider."""
+
+    attempt: int
+    usage: dict[str, Any]
+    http_status: int
+    request_id: str | None
+    latency_ms: int
+    stop_reason: str = ""
+
+
+@dataclass
 class ModelTurn:
     content: str | None
     tool_calls: list[ToolCallSpec] = field(default_factory=list)
@@ -23,3 +35,4 @@ class ModelTurn:
     http_status: int = 200
     request_id: str | None = None
     latency_ms: int = 0
+    http_calls: list[HttpCallRecord] = field(default_factory=list)

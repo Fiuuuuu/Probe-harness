@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.providers.base import HttpCallRecord
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
@@ -143,38 +144,50 @@ async def run_agent_loop(
                     estimated_input_tokens=est_in,
                 )
 
-                usage_norm = normalise_openai_usage(turn.usage)
                 req_body = {
                     "model": model,
                     "messages": messages,
                     "tools": TOOL_SCHEMAS,
                     "max_tokens": max_tok,
                 }
-                await store.execute(
-                    """
-                    INSERT INTO model_calls (
-                        run_id, step, attempt, input_total, cached_read, cache_write,
-                        uncached, output, reasoning, stop_reason, latency_ms,
-                        request_sha256, http_status, request_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        run_id,
-                        step,
-                        1,
-                        usage_norm["input_total"],
-                        usage_norm["cached_read"],
-                        usage_norm["cache_write"],
-                        usage_norm["uncached"],
-                        usage_norm["output"],
-                        usage_norm["reasoning"],
-                        turn.finish_reason,
-                        turn.latency_ms,
-                        request_sha256(req_body),
-                        turn.http_status,
-                        turn.request_id,
-                    ),
-                )
+                req_hash = request_sha256(req_body)
+                call_rows = turn.http_calls or [
+                    HttpCallRecord(
+                        attempt=1,
+                        usage=turn.usage,
+                        http_status=turn.http_status,
+                        request_id=turn.request_id,
+                        latency_ms=turn.latency_ms,
+                        stop_reason=turn.finish_reason,
+                    )
+                ]
+                for call_row in call_rows:
+                    row_usage = normalise_openai_usage(call_row.usage)
+                    await store.execute(
+                        """
+                        INSERT INTO model_calls (
+                            run_id, step, attempt, input_total, cached_read, cache_write,
+                            uncached, output, reasoning, stop_reason, latency_ms,
+                            request_sha256, http_status, request_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            step,
+                            call_row.attempt,
+                            row_usage["input_total"],
+                            row_usage["cached_read"],
+                            row_usage["cache_write"],
+                            row_usage["uncached"],
+                            row_usage["output"],
+                            row_usage["reasoning"],
+                            call_row.stop_reason or turn.finish_reason,
+                            call_row.latency_ms,
+                            req_hash,
+                            call_row.http_status,
+                            call_row.request_id,
+                        ),
+                    )
 
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
                 if turn.reasoning_content:
