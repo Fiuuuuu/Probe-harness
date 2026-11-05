@@ -114,6 +114,7 @@ async def run_agent_loop(
     step = 0
     stop_reason = "max_steps"
     status = "completed"
+    pending_exc: BaseException | None = None
 
     try:
         while step < max_steps:
@@ -137,6 +138,11 @@ async def run_agent_loop(
             except TokenCapReached:
                 stop_reason = "token_cap"
                 status = "failed"
+                break
+            except Exception as exc:
+                stop_reason = "exception"
+                status = "failed"
+                pending_exc = exc
                 break
 
             usage_norm = normalise_openai_usage(turn.usage)
@@ -261,5 +267,8 @@ async def run_agent_loop(
             status = "failed"
     finally:
         await _finalize_run(store, events, run_id, step, status, stop_reason, started_at)
+
+    if pending_exc is not None:
+        raise pending_exc
 
     return run_id

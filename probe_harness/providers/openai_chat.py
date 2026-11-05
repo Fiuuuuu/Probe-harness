@@ -17,9 +17,7 @@ from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 
-_SENSITIVE_KEYS = frozenset(
-    {"authorization", "x-api-key", "api-key", "x-auth-token", "bearer"}
-)
+_SENSITIVE_KEYS = frozenset({"authorization", "x-api-key", "api-key", "x-auth-token", "bearer"})
 
 
 def scrub_request_body(body: dict[str, Any]) -> dict[str, Any]:

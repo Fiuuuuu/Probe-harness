@@ -26,14 +26,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     task = json.loads(task_path.read_text(encoding="utf-8"))
     store = Store(Path(args.db) if args.db else None)
     stop_reason: str | None = None
+    run_status: str | None = None
+    provider: object | None = None
 
     async def _run() -> str:
-        nonlocal stop_reason
+        nonlocal stop_reason, run_status, provider
         await store.connect()
         try:
             if args.provider == "fake":
                 script = task.get("fake_script") or []
-                provider: object = FakeProvider(script)
+                provider = FakeProvider(script)
                 model = "fake"
             elif args.provider == "deepseek":
                 provider = OpenAIChatProvider(
@@ -54,12 +56,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 model=model,
                 max_steps=int(task.get("max_steps", 20)),
             )
-            row = await store.fetchone("SELECT stop_reason FROM runs WHERE id = ?", (run_id,))
-            stop_reason = row["stop_reason"] if row else None
-            if isinstance(provider, OpenAIChatProvider):
-                await provider.aclose()
+            row = await store.fetchone(
+                "SELECT stop_reason, status FROM runs WHERE id = ?",
+                (run_id,),
+            )
+            if row:
+                stop_reason = row["stop_reason"]
+                run_status = row["status"]
             return run_id
         finally:
+            if isinstance(provider, OpenAIChatProvider):
+                await provider.aclose()
             await store.close()
 
     run_id = asyncio.run(_run())
@@ -70,6 +77,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if stop_reason == "token_cap":
         print("stop_reason=token_cap", file=sys.stderr)
         return 2
+    if run_status == "failed":
+        return 1
     return 0
 
 

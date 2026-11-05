@@ -13,6 +13,13 @@ HARD_MAX_TASK_TOKENS = 200_000
 DEFAULT_LEDGER_PATH = Path(".harness/usage_ledger.jsonl")
 
 
+def shared_ledger_path() -> Path:
+    override = os.environ.get("HARNESS_LEDGER_PATH", "").strip()
+    if override:
+        return Path(override)
+    return DEFAULT_LEDGER_PATH
+
+
 class TokenCapReached(Exception):
     """Raised when a live API call would exceed the task token cap."""
 
@@ -55,7 +62,7 @@ class UsageLedger:
         path: Path | None = None,
         task_id: str = "default",
     ) -> None:
-        self.path = path or DEFAULT_LEDGER_PATH
+        self.path = path or shared_ledger_path()
         self.task_id = task_id
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if not self.path.exists():

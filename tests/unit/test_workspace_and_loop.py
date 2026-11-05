@@ -14,7 +14,9 @@ from probe_harness.tools.builtin import edit_file, glob_paths, read_file
 
 
 @pytest.mark.asyncio
-async def test_read_file_rejects_escape_to_sibling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_read_file_rejects_escape_to_sibling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ws = tmp_path / "ws"
     ws2 = tmp_path / "ws2"
     ws.mkdir()
@@ -29,7 +31,9 @@ async def test_read_file_rejects_escape_to_sibling(tmp_path: Path, monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_edit_file_rejects_outside_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_edit_file_rejects_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()
     outside = tmp_path / "outside.txt"
@@ -42,7 +46,9 @@ async def test_edit_file_rejects_outside_workspace(tmp_path: Path, monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_glob_filters_outside_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_glob_filters_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ws = tmp_path / "ws"
     ws2 = tmp_path / "ws2"
     ws.mkdir()
@@ -54,7 +60,9 @@ async def test_glob_filters_outside_workspace(tmp_path: Path, monkeypatch: pytes
 
 
 @pytest.mark.asyncio
-async def test_bad_read_file_args_do_not_stuck_running(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_bad_read_file_args_do_not_stuck_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()
     target = ws / "f.txt"
@@ -78,7 +86,11 @@ async def test_bad_read_file_args_do_not_stuck_running(tmp_path: Path, monkeypat
             "finish_reason": "tool_calls",
             "usage": {"prompt_tokens": 1, "completion_tokens": 1},
         },
-        {"content": "ok", "finish_reason": "stop", "usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+        {
+            "content": "ok",
+            "finish_reason": "stop",
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
     ]
     task = tmp_path / "task.json"
     task.write_text(json.dumps({"user_message": "go"}), encoding="utf-8")
@@ -104,15 +116,101 @@ async def test_token_cap_marks_run_failed(tmp_path: Path, monkeypatch: pytest.Mo
     class CapProvider:
         async def complete(self, *args, **kwargs):
             ledger.record_usage(10, 10, test_run_id="boom")
-            return type("T", (), {"usage": {}, "tool_calls": [], "content": "x", "finish_reason": "stop", "http_status": 200, "request_id": None, "latency_ms": 0, "reasoning_content": None})()
+            return type(
+                "T",
+                (),
+                {
+                    "usage": {},
+                    "tool_calls": [],
+                    "content": "x",
+                    "finish_reason": "stop",
+                    "http_status": 200,
+                    "request_id": None,
+                    "latency_ms": 0,
+                    "reasoning_content": None,
+                },
+            )()
 
     db = tmp_path / "cap.db"
     store = Store(db)
     await store.connect()
     task = tmp_path / "t.json"
     task.write_text(json.dumps({"user_message": "hi", "fake_script": []}), encoding="utf-8")
-    run_id = await run_agent_loop(store, CapProvider(), task, provider_name="deepseek", model="deepseek-flash")
+    run_id = await run_agent_loop(
+        store, CapProvider(), task, provider_name="deepseek", model="deepseek-flash"
+    )
     run = await store.fetchone("SELECT status, stop_reason FROM runs WHERE id = ?", (run_id,))
     assert run["status"] == "failed"
     assert run["stop_reason"] == "token_cap"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_token_cap_live_guard_skips_not_asserts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAX_TASK_TOKENS", "100")
+    ledger = UsageLedger(path=tmp_path / "ledger.jsonl", task_id="cap-test")
+    ledger.record_usage(95, 0, test_run_id="seed")
+
+    class CapProvider:
+        async def complete(self, *args, **kwargs):
+            ledger.record_usage(10, 10, test_run_id="boom")
+            return type(
+                "T",
+                (),
+                {
+                    "usage": {},
+                    "tool_calls": [],
+                    "content": "x",
+                    "finish_reason": "stop",
+                    "http_status": 200,
+                    "request_id": None,
+                    "latency_ms": 0,
+                    "reasoning_content": None,
+                },
+            )()
+
+    db = tmp_path / "cap.db"
+    store = Store(db)
+    await store.connect()
+    task = tmp_path / "t.json"
+    task.write_text(json.dumps({"user_message": "hi", "fake_script": []}), encoding="utf-8")
+    run_id = await run_agent_loop(
+        store, CapProvider(), task, provider_name="deepseek", model="deepseek-flash"
+    )
+    run = await store.fetchone("SELECT status, stop_reason FROM runs WHERE id = ?", (run_id,))
+    assert run["stop_reason"] == "token_cap"
+    with pytest.raises(pytest.skip.Exception, match="token cap reached"):
+        if run["stop_reason"] == "token_cap":
+            pytest.skip("token cap reached")
+        assert run["status"] == "completed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_exception_finalizes_then_reraises(tmp_path: Path) -> None:
+    class FailProvider:
+        async def complete(self, *args, **kwargs):
+            raise ConnectionError("network down")
+
+    db = tmp_path / "exc.db"
+    store = Store(db)
+    await store.connect()
+    task = tmp_path / "task.json"
+    task.write_text(json.dumps({"user_message": "hi"}), encoding="utf-8")
+
+    with pytest.raises(ConnectionError, match="network down"):
+        await run_agent_loop(store, FailProvider(), task, provider_name="deepseek", model="x")
+
+    run = await store.fetchone(
+        "SELECT id, status, stop_reason FROM runs ORDER BY started_at DESC LIMIT 1"
+    )
+    assert run["status"] == "failed"
+    assert run["stop_reason"] == "exception"
+    events = await store.fetchall(
+        "SELECT type FROM events WHERE run_id = ? ORDER BY seq",
+        (run["id"],),
+    )
+    assert events[-1]["type"] == "run_finished"
     await store.close()

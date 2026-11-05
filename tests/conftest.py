@@ -19,4 +19,9 @@ def pytest_runtest_makereport(item, call):
     if call.when == "call" and call.excinfo is not None:
         if call.excinfo.errisinstance(TokenCapReached):
             report.outcome = "skipped"
-            report.longrepr = (str(item.fspath), item.lineno, "token cap reached")
+            lineno = item.location[1] if item.location else 0
+            report.longrepr = (
+                str(item.path),
+                lineno or 0,
+                "Skipped: token cap reached",
+            )
