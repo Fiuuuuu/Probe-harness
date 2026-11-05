@@ -132,6 +132,7 @@ def _cmd_eval_run(args: argparse.Namespace) -> int:
                 split=args.split,
                 run_harness=not args.skip_harness,
                 resume=not args.no_resume,
+                provider=args.provider,
             )
         finally:
             await store.close()
@@ -191,6 +192,12 @@ def main(argv: list[str] | None = None) -> None:
     p_eval_run.add_argument("--dataset", default="SWE-bench/SWE-bench_Lite")
     p_eval_run.add_argument("--split", default="test")
     p_eval_run.add_argument("--db", default=None)
+    p_eval_run.add_argument(
+        "--provider",
+        default="deepseek",
+        choices=["fake", "deepseek"],
+        help="Agent provider (fake for offline patch extraction)",
+    )
     p_eval_run.add_argument(
         "--skip-harness",
         action="store_true",

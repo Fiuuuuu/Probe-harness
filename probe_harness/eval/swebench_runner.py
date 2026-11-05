@@ -22,6 +22,7 @@ from probe_harness.eval.predictions import (
     prediction_line,
     write_empty_prediction,
 )
+from probe_harness.providers.fake import FakeProvider
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.openai_chat import OpenAIChatProvider
 from probe_harness.store.db import Store
@@ -29,6 +30,7 @@ from probe_harness.store.db import Store
 DEFAULT_DATASET = "SWE-bench/SWE-bench_Lite"
 DEFAULT_SPLIT = "test"
 DEFAULT_MODEL_PATH = "probe-harness/deepseek-flash"
+FAKE_MODEL_PATH = "probe-harness/fake"
 _FIXTURE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TASK_FIXTURE = _FIXTURE_ROOT / "tests/fixtures/swebench_eval_task.json"
 
@@ -113,6 +115,25 @@ def prepare_instance_workspace(instance: dict[str, Any], workspace: Path) -> Non
     subprocess.run(["git", "clean", "-fdx"], cwd=workspace, check=True)
 
 
+async def eval_harness_complete(
+    store: Store,
+    agent_run_id: str,
+    instance_id: str,
+) -> bool:
+    row = await store.fetchone(
+        """
+        SELECT harness_run_id FROM eval_results
+        WHERE run_id = ? AND instance_id = ?
+        """,
+        (agent_run_id, instance_id),
+    )
+    return bool(row and row["harness_run_id"])
+
+
+def model_name_for_provider(provider: str) -> str:
+    return FAKE_MODEL_PATH if provider == "fake" else DEFAULT_MODEL_PATH
+
+
 async def _run_agent_on_instance(
     store: Store,
     *,
@@ -120,21 +141,29 @@ async def _run_agent_on_instance(
     task_path: Path,
     agent_run_id: str,
     instance_id: str,
+    provider_name: str = "deepseek",
 ) -> tuple[str, str | None]:
-    ledger = UsageLedger(task_id="harness-eval")
-    provider = OpenAIChatProvider(
-        ledger=ledger,
-        thinking_enabled=bool(task.get("thinking_enabled", True)),
-        max_tokens=int(task.get("max_tokens", 8192)),
-        test_run_id=f"eval-{agent_run_id}-{instance_id}",
-    )
+    if provider_name == "fake":
+        provider: object = FakeProvider(task.get("fake_script") or [])
+        model = "fake"
+        loop_provider = "fake"
+    else:
+        ledger = UsageLedger(task_id="harness-eval")
+        provider = OpenAIChatProvider(
+            ledger=ledger,
+            thinking_enabled=bool(task.get("thinking_enabled", True)),
+            max_tokens=int(task.get("max_tokens", 8192)),
+            test_run_id=f"eval-{agent_run_id}-{instance_id}",
+        )
+        model = "deepseek-flash"
+        loop_provider = "deepseek"
     try:
         run_id = await run_agent_loop(
             store,
             provider,
             task_path,
-            provider_name="deepseek",
-            model="deepseek-flash",
+            provider_name=loop_provider,
+            model=model,
             max_steps=int(task.get("max_steps", 50)),
             run_id=agent_run_id,
         )
@@ -146,7 +175,8 @@ async def _run_agent_on_instance(
     except TokenCapReached:
         raise
     finally:
-        await provider.aclose()
+        if isinstance(provider, OpenAIChatProvider):
+            await provider.aclose()
 
 
 async def _ensure_eval_run_stub(
@@ -227,11 +257,13 @@ async def run_eval_batch(
     split: str = DEFAULT_SPLIT,
     run_harness: bool = True,
     task_fixture: Path | None = None,
-    model_name_or_path: str = DEFAULT_MODEL_PATH,
+    model_name_or_path: str | None = None,
+    provider: str = "deepseek",
     resume: bool = True,
 ) -> EvalBatchResult:
     pred_path = predictions_path or default_predictions_path(batch_run_id)
     pred_path.parent.mkdir(parents=True, exist_ok=True)
+    model_path = model_name_or_path or model_name_for_provider(provider)
 
     harness_skip: str | None = None
     if run_harness and not is_docker_available():
@@ -239,70 +271,99 @@ async def run_eval_batch(
         harness_skip = "docker not available"
 
     results: list[InstanceEvalResult] = []
-    completed = indexed_predictions(pred_path) if resume else {}
+    predictions_index = indexed_predictions(pred_path) if resume else {}
 
     for instance_id in instance_ids:
-        if resume and instance_id in completed:
-            continue
         agent_run_id = batch_run_id if len(instance_ids) == 1 else f"{batch_run_id}-{instance_id}"
+        agent_done = resume and instance_id in predictions_index
+        harness_done = resume and await eval_harness_complete(store, agent_run_id, instance_id)
+
+        if agent_done and harness_done:
+            continue
+        if agent_done and harness_done is False and not run_harness:
+            continue
+
         agent_error: str | None = None
         patch = ""
         patch_files: list[str] = []
         harness_run_id: str | None = None
         eval_log_path: str | None = None
         resolved: bool | None = None
+        skipped_agent = False
 
-        try:
-            instance = load_swebench_instance(instance_id, dataset_name=dataset_name, split=split)
+        if agent_done:
+            skipped_agent = True
+            patch = str(predictions_index[instance_id].get("model_patch", ""))
             workspace = pred_path.parent / "workspaces" / instance_id
-            task_path = pred_path.parent / f"task_{instance_id}.json"
-            prepare_instance_workspace(instance, workspace)
-            task = build_eval_task(instance, task_fixture=task_fixture)
-            task_path.write_text(json.dumps(task, indent=2), encoding="utf-8")
-            prev_ws = os.environ.get("HARNESS_WORKSPACE")
-            os.environ["HARNESS_WORKSPACE"] = str(workspace)
+            if workspace.is_dir() and (workspace / ".git").exists():
+                patch, patch_files = collect_workspace_patch(workspace)
+            prior = await store.fetchone(
+                """
+                SELECT patch_files FROM eval_results
+                WHERE run_id = ? AND instance_id = ?
+                """,
+                (agent_run_id, instance_id),
+            )
+            if prior and prior["patch_files"]:
+                try:
+                    patch_files = json.loads(prior["patch_files"])
+                except json.JSONDecodeError:
+                    patch_files = []
+        else:
             try:
-                agent_run_id, _stop_reason = await _run_agent_on_instance(
-                    store,
-                    task=task,
-                    task_path=task_path,
-                    agent_run_id=agent_run_id,
-                    instance_id=instance_id,
+                instance = load_swebench_instance(
+                    instance_id, dataset_name=dataset_name, split=split
                 )
-            finally:
-                if prev_ws is None:
-                    os.environ.pop("HARNESS_WORKSPACE", None)
-                else:
-                    os.environ["HARNESS_WORKSPACE"] = prev_ws
+                workspace = pred_path.parent / "workspaces" / instance_id
+                task_path = pred_path.parent / f"task_{instance_id}.json"
+                prepare_instance_workspace(instance, workspace)
+                task = build_eval_task(instance, task_fixture=task_fixture)
+                task_path.write_text(json.dumps(task, indent=2), encoding="utf-8")
+                prev_ws = os.environ.get("HARNESS_WORKSPACE")
+                os.environ["HARNESS_WORKSPACE"] = str(workspace)
+                try:
+                    agent_run_id, _stop_reason = await _run_agent_on_instance(
+                        store,
+                        task=task,
+                        task_path=task_path,
+                        agent_run_id=agent_run_id,
+                        instance_id=instance_id,
+                        provider_name=provider,
+                    )
+                finally:
+                    if prev_ws is None:
+                        os.environ.pop("HARNESS_WORKSPACE", None)
+                    else:
+                        os.environ["HARNESS_WORKSPACE"] = prev_ws
 
-            patch, patch_files = collect_workspace_patch(workspace)
-            append_prediction(
-                pred_path,
-                prediction_line(
+                patch, patch_files = collect_workspace_patch(workspace)
+                append_prediction(
+                    pred_path,
+                    prediction_line(
+                        instance_id=instance_id,
+                        model_name_or_path=model_path,
+                        model_patch=patch,
+                    ),
+                    resume=True,
+                )
+            except TokenCapReached as exc:
+                agent_error = str(exc)
+                write_empty_prediction(
+                    pred_path,
                     instance_id=instance_id,
-                    model_name_or_path=model_name_or_path,
-                    model_patch=patch,
-                ),
-                resume=True,
-            )
-        except TokenCapReached as exc:
-            agent_error = str(exc)
-            write_empty_prediction(
-                pred_path,
-                instance_id=instance_id,
-                model_name_or_path=model_name_or_path,
-                resume=True,
-            )
-        except Exception as exc:
-            agent_error = str(exc)
-            write_empty_prediction(
-                pred_path,
-                instance_id=instance_id,
-                model_name_or_path=model_name_or_path,
-                resume=True,
-            )
+                    model_name_or_path=model_path,
+                    resume=True,
+                )
+            except Exception as exc:
+                agent_error = str(exc)
+                write_empty_prediction(
+                    pred_path,
+                    instance_id=instance_id,
+                    model_name_or_path=model_path,
+                    resume=True,
+                )
 
-        if run_harness and agent_error is None:
+        if run_harness and agent_error is None and not harness_done:
             harness_run_id = new_harness_run_id(batch_run_id[:8])
             summary = run_official_harness(
                 predictions_path=pred_path,
@@ -312,14 +373,36 @@ async def run_eval_batch(
                 harness_run_id=harness_run_id,
             )
             resolved = summary["resolved"].get(instance_id)
+            if summary.get("empty_patch", {}).get(instance_id):
+                resolved = False
             eval_log_path = summary["log_dir"]
+        elif harness_done:
+            row = await store.fetchone(
+                """
+                SELECT resolved, harness_run_id, eval_log_path, patch_sha256, patch_files
+                FROM eval_results WHERE run_id = ? AND instance_id = ?
+                """,
+                (agent_run_id, instance_id),
+            )
+            if row:
+                harness_run_id = row["harness_run_id"]
+                eval_log_path = row["eval_log_path"]
+                if row["resolved"] is not None:
+                    resolved = bool(row["resolved"])
+                if row["patch_files"]:
+                    try:
+                        patch_files = json.loads(row["patch_files"])
+                    except json.JSONDecodeError:
+                        pass
+                if not patch and row["patch_sha256"]:
+                    patch = patch or "(resume)"
 
         await _ensure_eval_run_stub(store, agent_run_id, instance_id, agent_error)
         await record_eval_result(
             store,
             agent_run_id=agent_run_id,
             instance_id=instance_id,
-            patch=patch,
+            patch=patch if patch != "(resume)" else "",
             patch_files=patch_files,
             resolved=resolved,
             harness_run_id=harness_run_id,
@@ -330,12 +413,15 @@ async def run_eval_batch(
             InstanceEvalResult(
                 instance_id=instance_id,
                 agent_run_id=agent_run_id,
-                patch=patch,
+                patch=patch if patch != "(resume)" else "",
                 patch_files=patch_files,
-                patch_sha256=hashlib.sha256(patch.encode()).hexdigest() if patch else "",
+                patch_sha256=hashlib.sha256(patch.encode()).hexdigest()
+                if patch and patch != "(resume)"
+                else "",
                 harness_run_id=harness_run_id,
                 resolved=resolved,
                 eval_log_path=eval_log_path,
+                skipped_agent=skipped_agent,
                 agent_error=agent_error,
             )
         )

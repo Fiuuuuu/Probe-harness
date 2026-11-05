@@ -50,6 +50,7 @@ def run_official_harness(
     )
 
     resolved: dict[str, bool | None] = {}
+    empty_patch: dict[str, bool] = {}
     for iid in instance_ids:
         pred_path = predictions_path
         preds = _load_predictions_map(pred_path)
@@ -57,13 +58,20 @@ def run_official_harness(
         if pred is None:
             resolved[iid] = None
             continue
+        patch_text = pred.get("model_patch") or ""
+        if not str(patch_text).strip():
+            resolved[iid] = False
+            empty_patch[iid] = True
+            continue
         model_key = pred["model_name_or_path"].replace("/", "__")
         report_file = RUN_EVALUATION_LOG_DIR / run_id / model_key / iid / LOG_REPORT
         resolved[iid] = _read_resolved_flag(report_file, iid)
+        empty_patch[iid] = False
 
     return {
         "harness_run_id": run_id,
         "resolved": resolved,
+        "empty_patch": empty_patch,
         "log_dir": str(RUN_EVALUATION_LOG_DIR / run_id),
     }
 

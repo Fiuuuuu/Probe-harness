@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from probe_harness.eval.cost import deepseek_flash_cost_usd
 from probe_harness.eval.docker_sandbox import (
     DOCKER_HARDENING_CREATE_KWARGS,
     DOCKER_HARDENING_RUN_ARGS,
@@ -291,3 +292,225 @@ def test_install_secure_container_factory_sets_create_kwargs(mock_run) -> None:
     kwargs = client.containers.create.call_args.kwargs
     assert kwargs["cap_drop"] == DOCKER_HARDENING_CREATE_KWARGS["cap_drop"]
     assert kwargs["pids_limit"] == 512
+    assert kwargs.get("network_mode") == "none"
+
+
+def test_deepseek_cost_off_peak() -> None:
+    cost = deepseek_flash_cost_usd(cached_read=1792, uncached=180, output=50)
+    assert cost > 0
+
+
+@patch("swebench.harness.run_evaluation.main")
+@patch("probe_harness.eval.harness_wrapper.install_secure_swebench_container_factory")
+def test_empty_patch_resolved_false(mock_install, mock_main, tmp_path: Path) -> None:
+    pred = tmp_path / "pred.jsonl"
+    pred.write_text(
+        json.dumps(
+            {
+                "instance_id": "pytest-dev__pytest-7432",
+                "model_name_or_path": "probe-harness/deepseek-flash",
+                "model_patch": "",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = run_official_harness(
+        predictions_path=pred,
+        instance_ids=["pytest-dev__pytest-7432"],
+        harness_run_id="empty-test",
+    )
+    assert summary["resolved"]["pytest-dev__pytest-7432"] is False
+    assert summary["empty_patch"]["pytest-dev__pytest-7432"] is True
+    mock_main.assert_called_once()
+
+
+@pytest.mark.asyncio
+@patch("probe_harness.eval.swebench_runner.run_official_harness")
+@patch("probe_harness.eval.swebench_runner.is_docker_available", return_value=True)
+@patch("probe_harness.eval.swebench_runner._run_agent_on_instance")
+async def test_resume_runs_harness_only_after_prediction(
+    mock_agent,
+    _mock_docker,
+    mock_harness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUN_EVAL", "1")
+    pred_path = tmp_path / "pred.jsonl"
+    append_prediction(
+        pred_path,
+        {
+            "instance_id": "pytest-dev__pytest-7432",
+            "model_name_or_path": "probe-harness/fake",
+            "model_patch": "diff --git a/x b/x",
+        },
+    )
+    mock_harness.return_value = {
+        "harness_run_id": "ph-resume",
+        "resolved": {"pytest-dev__pytest-7432": True},
+        "empty_patch": {"pytest-dev__pytest-7432": False},
+        "log_dir": "/tmp/log",
+    }
+
+    store = Store(tmp_path / "db.sqlite")
+    await store.connect()
+    result = await run_eval_batch(
+        instance_ids=["pytest-dev__pytest-7432"],
+        batch_run_id="batch-resume",
+        store=store,
+        predictions_path=pred_path,
+        run_harness=True,
+        resume=True,
+    )
+    await store.close()
+
+    mock_agent.assert_not_called()
+    mock_harness.assert_called_once()
+    assert len(result.instances) == 1
+    assert result.instances[0].skipped_agent is True
+    assert result.instances[0].resolved is True
+
+
+@pytest.mark.asyncio
+@patch("probe_harness.eval.swebench_runner.run_official_harness")
+@patch("probe_harness.eval.swebench_runner.is_docker_available", return_value=False)
+@patch("probe_harness.eval.swebench_runner.prepare_instance_workspace")
+@patch("probe_harness.eval.swebench_runner.load_swebench_instance")
+async def test_fake_provider_batch_offline(
+    mock_load,
+    mock_prepare,
+    _mock_docker,
+    mock_harness,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RUN_EVAL", "1")
+    mock_load.return_value = {
+        "instance_id": "pytest-dev__pytest-7432",
+        "repo": "pytest-dev/pytest",
+        "base_commit": "abc",
+        "problem_statement": "fix",
+    }
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    subprocess.run(["git", "init"], cwd=ws, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=ws, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=ws, check=True)
+    (ws / "f.py").write_text("1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "f.py"], cwd=ws, check=True)
+    subprocess.run(["git", "commit", "-m", "m"], cwd=ws, check=True)
+    (ws / "f.py").write_text("2\n", encoding="utf-8")
+
+    def _prep(_instance, workspace):
+        import shutil
+
+        workspace.mkdir(parents=True, exist_ok=True)
+        for item in ws.iterdir():
+            dest = workspace / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dest)
+
+    mock_prepare.side_effect = _prep
+
+    fixture = tmp_path / "task.json"
+    fixture.write_text(
+        json.dumps(
+            {
+                "system": "s",
+                "user_message": "edit f.py",
+                "fake_script": [
+                    {
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps({"path": "f.py", "content": "2\n"}),
+                                },
+                            }
+                        ],
+                        "finish_reason": "tool_calls",
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    },
+                    {
+                        "content": "done",
+                        "finish_reason": "stop",
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = Store(tmp_path / "db.sqlite")
+    await store.connect()
+    result = await run_eval_batch(
+        instance_ids=["pytest-dev__pytest-7432"],
+        batch_run_id="fake-batch",
+        store=store,
+        predictions_path=tmp_path / "pred.jsonl",
+        task_fixture=fixture,
+        provider="fake",
+        run_harness=False,
+    )
+    await store.close()
+
+    mock_harness.assert_not_called()
+    assert result.instances[0].patch_files == ["f.py"]
+    line = json.loads(result.predictions_path.read_text(encoding="utf-8").strip())
+    assert line["model_name_or_path"] == "probe-harness/fake"
+
+
+@pytest.mark.asyncio
+async def test_eval_report_includes_cost_and_stop_reason(tmp_path: Path) -> None:
+    store = Store(tmp_path / "db.sqlite")
+    await store.connect()
+    now = 1.0
+    await store.execute(
+        """
+        INSERT INTO runs (
+            id, task_ref, status, stop_reason, provider, model, config_hash, started_at, ended_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "run1",
+            "task",
+            "submitted",
+            "goal_met",
+            "fake",
+            "fake",
+            "abc",
+            now,
+            now + 1,
+        ),
+    )
+    await store.execute(
+        """
+        INSERT INTO model_calls (
+            run_id, step, attempt, input_total, cached_read, uncached, output, stop_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        ("run1", 1, 1, 100, 80, 20, 10, "stop"),
+    )
+    await record_eval_result(
+        store,
+        agent_run_id="run1",
+        instance_id="pytest-dev__pytest-7432",
+        patch="diff",
+        patch_files=["a.py"],
+        resolved=True,
+        harness_run_id="ph-1",
+        eval_log_path="/tmp/log",
+    )
+    data = await eval_report_data(store, "run1")
+    assert data is not None
+    text = format_eval_report(data)
+    assert "total_cost_usd" in text
+    assert "goal_met" in text
+    assert data["summary"]["total_tokens"] == 110
+    await store.close()

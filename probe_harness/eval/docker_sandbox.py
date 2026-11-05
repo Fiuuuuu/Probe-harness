@@ -13,6 +13,8 @@ DOCKER_HARDENING_CREATE_KWARGS: dict[str, Any] = {
     "cap_drop": ["ALL"],
     "security_opt": ["no-new-privileges:true"],
     "pids_limit": 512,
+    # D10: no egress; SWE-bench eval runs tests inside the image without external network.
+    "network_mode": "none",
 }
 
 # CLI flags for documentation / subprocess wrappers that accept docker run argv.
