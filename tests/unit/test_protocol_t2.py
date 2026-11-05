@@ -13,7 +13,6 @@ from probe_harness.providers.guards import (
     is_truncated_tool_call,
     merge_system_messages_openai,
     repair_tool_pairing,
-    validate_thinking_reasoning_passback,
 )
 from probe_harness.providers.ledger import UsageLedger
 from probe_harness.providers.openai_chat import (
@@ -30,31 +29,6 @@ from probe_harness.tools.registry import TOOL_SCHEMAS
 def test_c5_extract_reasoning_from_redacted_tag() -> None:
     msg = {"content": "hi <think>chain</think> rest"}
     assert extract_reasoning_content(msg) == "chain"
-
-
-def test_c5_thinking_passback_validation() -> None:
-    msgs = [
-        {"role": "user", "content": "u"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "c1",
-                    "type": "function",
-                    "function": {"name": "f", "arguments": "{}"},
-                }
-            ],
-        },
-    ]
-    assert validate_thinking_reasoning_passback(msgs, thinking_enabled=True)
-    msgs[1]["reasoning_content"] = "thought"
-    assert validate_thinking_reasoning_passback(msgs, thinking_enabled=True) is None
-    msgs[1]["reasoning_content"] = ""
-    assert validate_thinking_reasoning_passback(msgs, thinking_enabled=True) is None
-    del msgs[1]["reasoning_content"]
-    assert validate_thinking_reasoning_passback(msgs, thinking_enabled=True)
-    assert validate_thinking_reasoning_passback(msgs, thinking_enabled=False) is None
 
 
 def test_c8_assemble_stream_tool_calls() -> None:

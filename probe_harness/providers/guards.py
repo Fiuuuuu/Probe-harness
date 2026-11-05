@@ -12,39 +12,6 @@ from probe_harness.providers.usage import normalise_anthropic_usage, normalise_o
 
 TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "tool_use"})
 
-THINKING_REASONING_PASSBACK_ERROR = (
-    "The `reasoning_content` in the thinking mode must be passed back to the API."
-)
-
-
-def validate_thinking_reasoning_passback(
-    messages: list[dict[str, Any]],
-    *,
-    thinking_enabled: bool,
-) -> str | None:
-    """C5/C12: with thinking enabled, every assistant tool turn needs reasoning_content."""
-    if not thinking_enabled:
-        return None
-    for msg in messages:
-        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
-            continue
-        if "reasoning_content" not in msg:
-            return THINKING_REASONING_PASSBACK_ERROR
-    return None
-
-
-def thinking_passback_error_body(message: str) -> str:
-    return json.dumps(
-        {
-            "error": {
-                "message": message,
-                "type": "invalid_request_error",
-                "param": None,
-                "code": "invalid_request_error",
-            }
-        }
-    )
-
 
 def _system_text(content: Any) -> str:
     if isinstance(content, str):
