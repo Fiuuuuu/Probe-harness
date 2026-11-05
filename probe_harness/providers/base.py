@@ -23,6 +23,7 @@ class HttpCallRecord:
     request_id: str | None
     latency_ms: int
     stop_reason: str = ""
+    error_body: str = ""
 
 
 @dataclass
@@ -36,3 +37,19 @@ class ModelTurn:
     request_id: str | None = None
     latency_ms: int = 0
     http_calls: list[HttpCallRecord] = field(default_factory=list)
+    error_body: str = ""
+
+
+class ProviderCallError(Exception):
+    """Provider call failed after one or more HTTP attempts; carries partial call records."""
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        http_calls: list[HttpCallRecord] | None = None,
+        turn: ModelTurn | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.http_calls = http_calls or []
+        self.turn = turn

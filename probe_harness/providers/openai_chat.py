@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from probe_harness.providers.base import HttpCallRecord, ModelTurn, ToolCallSpec
+from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError, ToolCallSpec
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
@@ -19,8 +21,10 @@ DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-flash"
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_S = (1.0, 2.0, 4.0)
+ERROR_BODY_MAX = 800
 
 _SENSITIVE_KEYS = frozenset({"authorization", "x-api-key", "api-key", "x-auth-token", "bearer"})
+_BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 
 
 def scrub_request_body(body: dict[str, Any]) -> dict[str, Any]:
@@ -52,8 +56,32 @@ def _request_id(resp: httpx.Response) -> str | None:
     return resp.headers.get("x-request-id") or resp.headers.get("X-Request-Id")
 
 
+def error_body_from_text(text: str) -> str:
+    scrubbed = _BEARER_RE.sub("Bearer [REDACTED]", text)
+    return scrubbed[:ERROR_BODY_MAX]
+
+
+def error_body_from_response(resp: httpx.Response) -> str:
+    try:
+        return error_body_from_text(resp.text)
+    except Exception:
+        return ""
+
+
 def _is_retryable_status(status: int) -> bool:
     return status == 429 or status >= 500
+
+
+def _retry_sleep_seconds(resp: httpx.Response | None, attempt: int) -> float:
+    if resp is not None:
+        raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+        if raw:
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+    idx = min(attempt - 1, len(RETRY_BACKOFF_S) - 1)
+    return RETRY_BACKOFF_S[idx]
 
 
 def assemble_stream_tool_calls(
@@ -131,6 +159,15 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
     return turn, usage_raw
 
 
+@dataclass
+class _StreamReadResult:
+    lines: list[str]
+    resp: httpx.Response
+    latency_ms: int
+    received_stream_bytes: bool
+    stream_error: BaseException | None = None
+
+
 class OpenAIChatProvider:
     def __init__(
         self,
@@ -191,7 +228,21 @@ class OpenAIChatProvider:
             body["stream_options"] = {"include_usage": True}
         return body
 
-    def _record_response_usage(self, usage_raw: dict[str, Any]) -> None:
+    def _usage_has_tokens(self, usage_raw: dict[str, Any]) -> bool:
+        norm = normalise_openai_usage(usage_raw)
+        return norm["input_total"] + norm["output"] > 0
+
+    def _record_response_usage(
+        self,
+        usage_raw: dict[str, Any],
+        *,
+        est_in: int,
+        max_tokens: int,
+        stream: bool,
+    ) -> None:
+        if stream and not self._usage_has_tokens(usage_raw):
+            self.ledger.record_usage(est_in, max_tokens, test_run_id=self.test_run_id)
+            return
         norm = normalise_openai_usage(usage_raw)
         self.ledger.record_usage(
             norm["input_total"],
@@ -206,6 +257,8 @@ class OpenAIChatProvider:
         resp: httpx.Response,
         latency_ms: int,
         finish_reason: str,
+        *,
+        error_body: str = "",
     ) -> HttpCallRecord:
         return HttpCallRecord(
             attempt=attempt,
@@ -214,6 +267,7 @@ class OpenAIChatProvider:
             request_id=_request_id(resp),
             latency_ms=latency_ms,
             stop_reason=finish_reason,
+            error_body=error_body,
         )
 
     async def _post_json(
@@ -231,16 +285,36 @@ class OpenAIChatProvider:
         url: str,
         headers: dict[str, str],
         body: dict[str, Any],
-    ) -> tuple[list[str], httpx.Response, int]:
+    ) -> _StreamReadResult:
         t0 = time.perf_counter()
         lines: list[str] = []
+        received_stream_bytes = False
         async with client.stream("POST", url, headers=headers, json=body) as resp:
-            async for line in resp.aiter_lines():
-                if line:
-                    lines.append(line)
+            if resp.status_code >= 400:
+                await resp.aread()
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return _StreamReadResult(lines, resp, latency_ms, False)
+
+            try:
+                async for line in resp.aiter_lines():
+                    if line:
+                        lines.append(line)
+                        if line.strip().startswith("data:") and line.strip() not in (
+                            "data: [DONE]",
+                            "data:[DONE]",
+                        ):
+                            received_stream_bytes = True
+            except httpx.HTTPError as exc:
+                latency_ms = int((time.perf_counter() - t0) * 1000)
+                return _StreamReadResult(
+                    lines,
+                    resp,
+                    latency_ms,
+                    received_stream_bytes,
+                    stream_error=exc,
+                )
             latency_ms = int((time.perf_counter() - t0) * 1000)
-            await resp.aread()
-            return lines, resp, latency_ms
+            return _StreamReadResult(lines, resp, latency_ms, received_stream_bytes)
 
     async def _one_json_attempt(
         self,
@@ -249,30 +323,44 @@ class OpenAIChatProvider:
         headers: dict[str, str],
         body: dict[str, Any],
         attempt: int,
-    ) -> tuple[ModelTurn, HttpCallRecord, bool]:
-        """Returns (turn, record, should_retry)."""
+        *,
+        est_in: int,
+        max_tokens: int,
+    ) -> tuple[ModelTurn, HttpCallRecord, bool, httpx.Response | None]:
+        """Returns (turn, record, should_retry, response_for_backoff)."""
         t0 = time.perf_counter()
         resp = await self._post_json(client, url, headers, body)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         usage_raw: dict[str, Any] = {}
         data: dict[str, Any] = {}
+        err_body = ""
         try:
             data = resp.json()
             usage_raw = data.get("usage") or {}
         except (json.JSONDecodeError, ValueError):
             data = {}
-
-        self._record_response_usage(usage_raw)
+        if resp.status_code >= 400:
+            err_body = error_body_from_response(resp)
 
         finish = "error"
         if resp.status_code < 400:
             choice = (data.get("choices") or [{}])[0]
             finish = choice.get("finish_reason") or "stop"
 
-        record = self._http_call_record(attempt, usage_raw, resp, latency_ms, finish)
+        record = self._http_call_record(
+            attempt, usage_raw, resp, latency_ms, finish, error_body=err_body
+        )
+        try:
+            self._record_response_usage(
+                usage_raw, est_in=est_in, max_tokens=max_tokens, stream=False
+            )
+        except TokenCapReached as cap:
+            cap.pending_record = record  # type: ignore[attr-defined]
+            raise
+
         if resp.status_code < 400:
             turn = self._turn_from_json(data, resp, latency_ms)
-            return turn, record, False
+            return turn, record, False, resp
 
         should_retry = _is_retryable_status(resp.status_code)
         turn = ModelTurn(
@@ -282,8 +370,9 @@ class OpenAIChatProvider:
             http_status=resp.status_code,
             request_id=_request_id(resp),
             latency_ms=latency_ms,
+            error_body=err_body,
         )
-        return turn, record, should_retry
+        return turn, record, should_retry, resp
 
     async def _one_stream_attempt(
         self,
@@ -292,25 +381,81 @@ class OpenAIChatProvider:
         headers: dict[str, str],
         body: dict[str, Any],
         attempt: int,
-    ) -> tuple[ModelTurn, HttpCallRecord, bool]:
-        lines, resp, latency_ms = await self._post_stream(client, url, headers, body)
-        streamed_payload = any(
-            ln.strip().startswith("data:") and ln.strip() not in ("data: [DONE]", "data:[DONE]")
-            for ln in lines
-        )
+        *,
+        est_in: int,
+        max_tokens: int,
+    ) -> tuple[ModelTurn, HttpCallRecord, bool, httpx.Response | None]:
+        stream_result = await self._post_stream(client, url, headers, body)
+        resp = stream_result.resp
+        latency_ms = stream_result.latency_ms
+        received = stream_result.received_stream_bytes
         usage_raw: dict[str, Any] = {}
         finish = "error"
+        err_body = ""
+
+        if stream_result.stream_error is not None:
+            err_body = error_body_from_text(str(stream_result.stream_error))
+            turn = ModelTurn(
+                content=None,
+                finish_reason="error",
+                http_status=resp.status_code,
+                error_body=err_body,
+            )
+            usage_raw = {}
+            if stream_result.lines and received:
+                parsed_turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
+                turn.content = parsed_turn.content
+                turn.tool_calls = parsed_turn.tool_calls
+                turn.reasoning_content = parsed_turn.reasoning_content
+                turn.usage = usage_raw
+                turn.finish_reason = "stream_interrupted"
+            finish = "stream_interrupted"
+            if usage_raw:
+                try:
+                    self._record_response_usage(
+                        usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
+                    )
+                except TokenCapReached as cap:
+                    record = self._http_call_record(
+                        attempt,
+                        usage_raw,
+                        resp,
+                        latency_ms,
+                        finish,
+                        error_body=err_body,
+                    )
+                    cap.pending_record = record  # type: ignore[attr-defined]
+                    raise
+            record = self._http_call_record(
+                attempt,
+                usage_raw,
+                resp,
+                latency_ms,
+                finish,
+                error_body=err_body,
+            )
+            turn.latency_ms = latency_ms
+            turn.request_id = _request_id(resp)
+            should_retry = not received
+            return turn, record, should_retry, resp
 
         if resp.status_code < 400:
-            turn, usage_raw = parse_sse_stream_payload(lines)
+            turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
             turn.latency_ms = latency_ms
             turn.request_id = _request_id(resp)
             turn.http_status = resp.status_code
             finish = turn.finish_reason
-            self._record_response_usage(usage_raw)
             record = self._http_call_record(attempt, usage_raw, resp, latency_ms, finish)
-            return turn, record, False
+            try:
+                self._record_response_usage(
+                    usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
+                )
+            except TokenCapReached as cap:
+                cap.pending_record = record  # type: ignore[attr-defined]
+                raise
+            return turn, record, False, resp
 
+        err_body = error_body_from_response(resp)
         try:
             if resp.content:
                 err_data = json.loads(resp.content)
@@ -318,8 +463,12 @@ class OpenAIChatProvider:
         except (json.JSONDecodeError, ValueError):
             pass
         if usage_raw:
-            self._record_response_usage(usage_raw)
-        record = self._http_call_record(attempt, usage_raw, resp, latency_ms, finish)
+            self._record_response_usage(
+                usage_raw, est_in=est_in, max_tokens=max_tokens, stream=False
+            )
+        record = self._http_call_record(
+            attempt, usage_raw, resp, latency_ms, finish, error_body=err_body
+        )
         turn = ModelTurn(
             content=None,
             finish_reason="error",
@@ -327,9 +476,17 @@ class OpenAIChatProvider:
             http_status=resp.status_code,
             request_id=_request_id(resp),
             latency_ms=latency_ms,
+            error_body=err_body,
         )
-        should_retry = _is_retryable_status(resp.status_code) and not streamed_payload
-        return turn, record, should_retry
+        should_retry = _is_retryable_status(resp.status_code) and not received
+        return turn, record, should_retry, resp
+
+    def _raise_token_cap(self, exc: TokenCapReached, http_calls: list[HttpCallRecord]) -> None:
+        pending = getattr(exc, "pending_record", None)
+        if pending is not None and pending not in http_calls:
+            http_calls.append(pending)
+        exc.http_calls = http_calls  # type: ignore[attr-defined]
+        raise exc
 
     async def _execute_with_retry(
         self,
@@ -339,7 +496,6 @@ class OpenAIChatProvider:
         max_tokens: int,
         stream: bool,
     ) -> tuple[ModelTurn, list[HttpCallRecord]]:
-        self.ledger.check_reservation(est_in, max_tokens)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -347,25 +503,44 @@ class OpenAIChatProvider:
         url = f"{self.base_url}/chat/completions"
         client = await self._get_client()
         http_calls: list[HttpCallRecord] = []
+        turn = ModelTurn(content=None, finish_reason="error")
 
         for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                self.ledger.check_reservation(est_in, max_tokens)
+            except TokenCapReached as cap:
+                self._raise_token_cap(cap, http_calls)
+
             should_retry = False
+            retry_resp: httpx.Response | None = None
+            record: HttpCallRecord | None = None
             try:
                 if stream:
-                    turn, record, should_retry = await self._one_stream_attempt(
-                        client, url, headers, body, attempt
+                    turn, record, should_retry, retry_resp = await self._one_stream_attempt(
+                        client,
+                        url,
+                        headers,
+                        body,
+                        attempt,
+                        est_in=est_in,
+                        max_tokens=max_tokens,
                     )
                 else:
-                    turn, record, should_retry = await self._one_json_attempt(
-                        client, url, headers, body, attempt
+                    turn, record, should_retry, retry_resp = await self._one_json_attempt(
+                        client,
+                        url,
+                        headers,
+                        body,
+                        attempt,
+                        est_in=est_in,
+                        max_tokens=max_tokens,
                     )
-            except TokenCapReached:
-                raise
-            except httpx.HTTPError:
-                if attempt >= MAX_RETRY_ATTEMPTS:
-                    raise
-                should_retry = True
-                turn = ModelTurn(content=None, finish_reason="error", http_status=0)
+            except TokenCapReached as cap:
+                if record is not None:
+                    http_calls.append(record)
+                self._raise_token_cap(cap, http_calls)
+            except httpx.HTTPError as exc:
+                err_body = error_body_from_text(str(exc))
                 record = HttpCallRecord(
                     attempt=attempt,
                     usage={},
@@ -373,15 +548,26 @@ class OpenAIChatProvider:
                     request_id=None,
                     latency_ms=0,
                     stop_reason="network_error",
+                    error_body=err_body,
                 )
+                http_calls.append(record)
+                if attempt >= MAX_RETRY_ATTEMPTS:
+                    raise ProviderCallError(str(exc), http_calls=http_calls, turn=turn) from exc
+                should_retry = True
+                retry_resp = None
+            else:
+                assert record is not None
+                http_calls.append(record)
+                if not should_retry:
+                    turn.http_calls = http_calls
+                    return turn, http_calls
 
-            http_calls.append(record)
-            if not should_retry:
-                turn.http_calls = http_calls
-                return turn, http_calls
-            if attempt < MAX_RETRY_ATTEMPTS:
-                await asyncio.sleep(RETRY_BACKOFF_S[attempt - 1])
+            if attempt < MAX_RETRY_ATTEMPTS and should_retry:
+                await asyncio.sleep(_retry_sleep_seconds(retry_resp, attempt))
                 continue
+
+            turn.http_calls = http_calls
+            return turn, http_calls
 
         turn.http_calls = http_calls
         return turn, http_calls
