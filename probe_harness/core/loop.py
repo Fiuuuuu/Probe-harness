@@ -10,9 +10,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
-from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
+from probe_harness.providers.usage import (
+    estimate_chat_input_tokens,
+    normalise_anthropic_usage,
+    normalise_openai_usage,
+)
 from probe_harness.store.db import EventWriter, Store
 from probe_harness.tools.names import normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS, execute_tool
@@ -36,6 +41,74 @@ def config_hash(provider: str, model: str, task_path: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+def _normalise_usage(provider_name: str, usage: dict[str, Any]) -> dict[str, int]:
+    if provider_name == "fake" or provider_name == "deepseek":
+        return normalise_openai_usage(usage)
+    if provider_name == "anthropic" or provider_name.endswith("-anthropic"):
+        return normalise_anthropic_usage(usage)
+    raise ValueError(f"unknown provider for usage normalisation: {provider_name!r}")
+
+
+async def _persist_model_calls(
+    store: Store,
+    *,
+    run_id: str,
+    step: int,
+    model: str,
+    messages: list[dict[str, Any]],
+    max_tok: int,
+    turn: Any,
+    call_rows: list[HttpCallRecord],
+    provider_name: str,
+) -> None:
+    req_body = {
+        "model": model,
+        "messages": messages,
+        "tools": TOOL_SCHEMAS,
+        "max_tokens": max_tok,
+    }
+    req_hash = request_sha256(req_body)
+    for call_row in call_rows:
+        row_usage = _normalise_usage(provider_name, call_row.usage)
+        await store.execute(
+            """
+            INSERT INTO model_calls (
+                run_id, step, attempt, input_total, cached_read, cache_write,
+                uncached, output, reasoning, stop_reason, latency_ms,
+                request_sha256, http_status, request_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                step,
+                call_row.attempt,
+                row_usage["input_total"],
+                row_usage["cached_read"],
+                row_usage["cache_write"],
+                row_usage["uncached"],
+                row_usage["output"],
+                row_usage["reasoning"],
+                call_row.stop_reason or turn.finish_reason,
+                call_row.latency_ms,
+                req_hash,
+                call_row.http_status,
+                call_row.request_id,
+            ),
+        )
+
+
+def _provider_error_payload(turn: Any, call_rows: list[HttpCallRecord]) -> dict[str, Any]:
+    last = call_rows[-1] if call_rows else None
+    status = last.http_status if last is not None else turn.http_status
+    request_id = turn.request_id or (last.request_id if last else None)
+    error_body = turn.error_body or (last.error_body if last else "")
+    return {
+        "http_status": status,
+        "request_id": request_id,
+        "error_body": error_body,
+    }
+
+
 async def _finalize_run(
     store: Store,
     events: EventWriter,
@@ -44,17 +117,21 @@ async def _finalize_run(
     status: str,
     stop_reason: str,
     started_at: float,
+    *,
+    error_detail: dict[str, Any] | None = None,
 ) -> None:
     ended = time.time()
     await store.execute(
         "UPDATE runs SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
         (status, stop_reason, ended, run_id),
     )
-    payload = {
+    payload: dict[str, Any] = {
         "status": status,
         "stop_reason": stop_reason,
         "agent_time_s": ended - started_at,
     }
+    if error_detail:
+        payload["provider_error"] = error_detail
     await events.append(
         run_id,
         step,
@@ -122,6 +199,7 @@ async def run_agent_loop(
     stop_reason = "max_steps"
     status = "completed"
     pending_exc: BaseException | None = None
+    error_detail: dict[str, Any] | None = None
 
     try:
         while step < max_steps:
@@ -136,45 +214,50 @@ async def run_agent_loop(
 
                 max_tok = task.get("max_tokens", 8192)
                 est_in = estimate_chat_input_tokens(messages, TOOL_SCHEMAS)
+                use_stream = bool(task.get("stream", False)) and provider_name == "deepseek"
                 turn = await provider.complete(
                     messages,
                     tools=TOOL_SCHEMAS,
                     max_tokens=max_tok,
                     estimated_input_tokens=est_in,
+                    stream=use_stream,
                 )
 
-                usage_norm = normalise_openai_usage(turn.usage)
-                req_body = {
-                    "model": model,
-                    "messages": messages,
-                    "tools": TOOL_SCHEMAS,
-                    "max_tokens": max_tok,
-                }
-                await store.execute(
-                    """
-                    INSERT INTO model_calls (
-                        run_id, step, attempt, input_total, cached_read, cache_write,
-                        uncached, output, reasoning, stop_reason, latency_ms,
-                        request_sha256, http_status, request_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
+                call_rows = turn.http_calls or [
+                    HttpCallRecord(
+                        attempt=1,
+                        usage=turn.usage,
+                        http_status=turn.http_status,
+                        request_id=turn.request_id,
+                        latency_ms=turn.latency_ms,
+                        stop_reason=turn.finish_reason,
+                        error_body=turn.error_body,
+                    )
+                ]
+                await _persist_model_calls(
+                    store,
+                    run_id=run_id,
+                    step=step,
+                    model=model,
+                    messages=messages,
+                    max_tok=max_tok,
+                    turn=turn,
+                    call_rows=call_rows,
+                    provider_name=provider_name,
+                )
+
+                if turn.finish_reason == "stream_interrupted":
+                    stop_reason = "provider_error"
+                    status = "failed"
+                    error_detail = _provider_error_payload(turn, call_rows)
+                    await events.append(
                         run_id,
                         step,
-                        1,
-                        usage_norm["input_total"],
-                        usage_norm["cached_read"],
-                        usage_norm["cache_write"],
-                        usage_norm["uncached"],
-                        usage_norm["output"],
-                        usage_norm["reasoning"],
-                        turn.finish_reason,
-                        turn.latency_ms,
-                        request_sha256(req_body),
-                        turn.http_status,
-                        turn.request_id,
-                    ),
-                )
+                        "provider_error",
+                        time.time(),
+                        json.dumps(error_detail),
+                    )
+                    break
 
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
                 if turn.reasoning_content:
@@ -205,6 +288,14 @@ async def run_agent_loop(
                 if turn.http_status >= 400:
                     stop_reason = "provider_error"
                     status = "failed"
+                    error_detail = _provider_error_payload(turn, call_rows)
+                    await events.append(
+                        run_id,
+                        step,
+                        "provider_error",
+                        time.time(),
+                        json.dumps(error_detail),
+                    )
                     break
 
                 if not turn.tool_calls:
@@ -266,9 +357,54 @@ async def run_agent_loop(
                     )
 
                 step += 1
-            except TokenCapReached:
+            except TokenCapReached as cap:
                 stop_reason = "token_cap"
                 status = "failed"
+                extra_calls = getattr(cap, "http_calls", None) or []
+                if extra_calls:
+                    stub_turn = ModelTurn(content=None, finish_reason="token_cap", http_status=0)
+                    await _persist_model_calls(
+                        store,
+                        run_id=run_id,
+                        step=step,
+                        model=model,
+                        messages=messages,
+                        max_tok=max_tok,
+                        turn=stub_turn,
+                        call_rows=extra_calls,
+                        provider_name=provider_name,
+                    )
+                break
+            except ProviderCallError as pce:
+                stop_reason = "provider_error"
+                status = "failed"
+                turn_err = pce.turn or ModelTurn(
+                    content=None,
+                    finish_reason="error",
+                    http_status=0,
+                    error_body=str(pce)[:800],
+                )
+                if pce.http_calls:
+                    await _persist_model_calls(
+                        store,
+                        run_id=run_id,
+                        step=step,
+                        model=model,
+                        messages=messages,
+                        max_tok=max_tok,
+                        turn=turn_err,
+                        call_rows=pce.http_calls,
+                        provider_name=provider_name,
+                    )
+                    error_detail = _provider_error_payload(turn_err, pce.http_calls)
+                    await events.append(
+                        run_id,
+                        step,
+                        "provider_error",
+                        time.time(),
+                        json.dumps(error_detail),
+                    )
+                pending_exc = pce
                 break
             except asyncio.CancelledError as exc:
                 status, stop_reason, pending_exc = _record_loop_exception(exc)
@@ -279,7 +415,16 @@ async def run_agent_loop(
         else:
             status = "failed"
     finally:
-        await _finalize_run(store, events, run_id, step, status, stop_reason, started_at)
+        await _finalize_run(
+            store,
+            events,
+            run_id,
+            step,
+            status,
+            stop_reason,
+            started_at,
+            error_detail=error_detail,
+        )
 
     if pending_exc is not None:
         raise pending_exc
