@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -74,7 +75,7 @@ def normalise_anthropic_usage(usage: dict[str, Any] | None) -> dict[str, int]:
 
 
 def merge_stream_usage_chunks(chunks: list[dict[str, Any]]) -> dict[str, int]:
-    """Merge streaming usage chunks (Anthropic start-zero + delta pattern)."""
+    """Merge streaming usage chunks (Anthropic: take last non-zero per field, do not sum)."""
     if not chunks:
         return normalise_openai_usage(None)
 
@@ -86,8 +87,23 @@ def merge_stream_usage_chunks(chunks: list[dict[str, Any]]) -> dict[str, int]:
             "cache_read_input_tokens",
             "cache_creation_input_tokens",
         ):
-            merged[key] = sum(int(c.get(key) or 0) for c in chunks)
+            last_nonzero = 0
+            for chunk in chunks:
+                val = int(chunk.get(key) or 0)
+                if val != 0:
+                    last_nonzero = val
+            merged[key] = last_nonzero
         return normalise_anthropic_usage(merged)
 
     last = chunks[-1]
     return normalise_openai_usage(last)
+
+
+def estimate_chat_input_tokens(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+) -> int:
+    """Conservative pre-call input estimate for token-cap reservation."""
+    payload = json.dumps({"messages": messages, "tools": tools or []}, ensure_ascii=False)
+    # ~3 chars/token plus headroom for provider-side formatting
+    return max(256, len(payload) // 3 + 512)

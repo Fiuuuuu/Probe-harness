@@ -11,15 +11,18 @@ import httpx
 
 from probe_harness.providers.ledger import UsageLedger
 from probe_harness.providers.openai_chat import OpenAIChatProvider
-from probe_harness.providers.usage import normalise_openai_usage
+from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
 HOST = "api.deepseek.com"
 BASE_URL = f"https://{HOST}"
 
+# ok: True=pass, False=fail, None=skipped (N1)
+NetRow = tuple[str, bool | None, str]
+
 
 async def check_dns() -> tuple[bool, str]:
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         infos = await loop.run_in_executor(None, lambda: socket.getaddrinfo(HOST, 443))
         addrs = sorted({i[4][0] for i in infos})
         return True, ", ".join(addrs[:3])
@@ -46,7 +49,7 @@ async def check_tls() -> tuple[bool, str]:
                 with ctx.wrap_socket(sock, server_hostname=HOST) as ssock:
                     return ssock.version() or "tls_ok"
 
-        version = await asyncio.get_event_loop().run_in_executor(None, _handshake)
+        version = await asyncio.get_running_loop().run_in_executor(None, _handshake)
         return True, version
     except OSError as exc:
         return False, str(exc)
@@ -54,7 +57,7 @@ async def check_tls() -> tuple[bool, str]:
 
 async def check_unauthenticated_http() -> tuple[bool, str]:
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
             resp = await client.post(
                 f"{BASE_URL}/chat/completions",
                 json={
@@ -87,24 +90,28 @@ async def check_authenticated_live(ledger: UsageLedger) -> tuple[bool, str]:
         max_tokens=1,
         test_run_id="net-check",
     )
+    turn = None
     try:
+        messages = [{"role": "user", "content": "Reply with the single letter x."}]
         turn = await provider.complete(
-            [{"role": "user", "content": "Reply with the single letter x."}],
+            messages,
             max_tokens=1,
             thinking_enabled=False,
-            estimated_input_tokens=32,
+            estimated_input_tokens=estimate_chat_input_tokens(messages),
         )
     except Exception as exc:
         return False, str(exc)
+    finally:
+        await provider.aclose()
 
-    if turn.http_status >= 400:
+    if turn is None or turn.http_status >= 400:
         return False, f"http_{turn.http_status}"
     norm = normalise_openai_usage(turn.usage)
     return True, f"live_ok usage_in={norm['input_total']} out={norm['output']}"
 
 
-async def run_net_check() -> tuple[list[tuple[str, bool, str]], bool, int]:
-    rows: list[tuple[str, bool, str]] = []
+async def run_net_check() -> tuple[list[NetRow], bool, int]:
+    rows: list[NetRow] = []
     ledger = UsageLedger(task_id="net-check")
 
     for name, coro in (
@@ -116,25 +123,31 @@ async def run_net_check() -> tuple[list[tuple[str, bool, str]], bool, int]:
         ok, detail = await coro
         rows.append((name, ok, detail))
 
-    core_ok = all(r[1] for r in rows)
+    core_ok = all(r[1] is True for r in rows)
 
     if os.environ.get("RUN_LIVE") == "1" and os.environ.get("DEEPSEEK_API_KEY"):
         live_ok, live_detail = await check_authenticated_live(ledger)
         rows.append(("live_authenticated", live_ok, live_detail))
     else:
-        rows.append(("live_authenticated", True, "skipped"))
+        if not os.environ.get("DEEPSEEK_API_KEY"):
+            detail = "skipped_no_key"
+        elif os.environ.get("RUN_LIVE") != "1":
+            detail = "skipped_run_live_not_set"
+        else:
+            detail = "skipped"
+        rows.append(("live_authenticated", None, detail))
 
     return rows, core_ok, ledger.total_tokens_used()
 
 
-def print_net_check_table(
-    rows: list[tuple[str, bool, str]],
-    reachable: bool,
-    cumulative: int,
-) -> None:
+def print_net_check_table(rows: list[NetRow], reachable: bool, cumulative: int) -> None:
     print("| check | ok | detail |")
     print("|---|---|---|")
     for name, ok, detail in rows:
-        print(f"| {name} | {'yes' if ok else 'no'} | {detail} |")
+        if ok is None:
+            ok_str = "skip"
+        else:
+            ok_str = "yes" if ok else "no"
+        print(f"| {name} | {ok_str} | {detail} |")
     print(f"| reachable | {'yes' if reachable else 'no'} | |")
     print(f"| ledger_cumulative_tokens | | {cumulative} |")

@@ -25,8 +25,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     task = json.loads(task_path.read_text(encoding="utf-8"))
     store = Store(Path(args.db) if args.db else None)
+    stop_reason: str | None = None
 
     async def _run() -> str:
+        nonlocal stop_reason
         await store.connect()
         try:
             if args.provider == "fake":
@@ -52,6 +54,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 model=model,
                 max_steps=int(task.get("max_steps", 20)),
             )
+            row = await store.fetchone("SELECT stop_reason FROM runs WHERE id = ?", (run_id,))
+            stop_reason = row["stop_reason"] if row else None
+            if isinstance(provider, OpenAIChatProvider):
+                await provider.aclose()
             return run_id
         finally:
             await store.close()
@@ -59,7 +65,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     run_id = asyncio.run(_run())
     print(run_id)
     ledger = UsageLedger()
-    print(f"ledger_cumulative_tokens={ledger.total_tokens_used()}")
+    cumulative = ledger.total_tokens_used()
+    print(f"ledger_cumulative_tokens={cumulative}")
+    if stop_reason == "token_cap":
+        print("stop_reason=token_cap", file=sys.stderr)
+        return 2
     return 0
 
 
@@ -84,6 +94,7 @@ def _cmd_report(args: argparse.Namespace) -> int:
 def _cmd_net_check(_: argparse.Namespace) -> int:
     rows, reachable, cumulative = asyncio.run(run_net_check())
     print_net_check_table(rows, reachable, cumulative)
+    print(f"ledger_cumulative_tokens={cumulative}")
     return 0 if reachable else 2
 
 

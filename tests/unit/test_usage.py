@@ -71,3 +71,22 @@ def test_anthropic_stream_merge_start_zero_delta() -> None:
     norm = merge_stream_usage_chunks([start, delta])
     assert norm["input_total"] == 2137
     assert norm["cached_read"] == 2136
+
+
+def test_anthropic_stream_merge_last_nonzero_not_sum() -> None:
+    start = {
+        "input_tokens": 99,
+        "output_tokens": 1,
+        "cache_read_input_tokens": 500,
+        "cache_creation_input_tokens": 0,
+    }
+    delta = {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "cache_read_input_tokens": 2136,
+        "cache_creation_input_tokens": 0,
+    }
+    norm = merge_stream_usage_chunks([start, delta])
+    assert norm["input_total"] == 2137
+    assert norm["cached_read"] == 2136
+    assert norm["uncached"] == 1

@@ -9,8 +9,9 @@ import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
-from probe_harness.providers.usage import normalise_openai_usage
+from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 from probe_harness.store.db import EventWriter, Store
 from probe_harness.tools.names import normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS, execute_tool
@@ -34,6 +35,34 @@ def config_hash(provider: str, model: str, task_path: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
+async def _finalize_run(
+    store: Store,
+    events: EventWriter,
+    run_id: str,
+    step: int,
+    status: str,
+    stop_reason: str,
+    started_at: float,
+) -> None:
+    ended = time.time()
+    await store.execute(
+        "UPDATE runs SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
+        (status, stop_reason, ended, run_id),
+    )
+    payload = {
+        "status": status,
+        "stop_reason": stop_reason,
+        "agent_time_s": ended - started_at,
+    }
+    await events.append(
+        run_id,
+        step,
+        "run_finished",
+        time.time(),
+        json.dumps(payload),
+    )
+
+
 async def run_agent_loop(
     store: Store,
     provider: ChatProvider,
@@ -46,7 +75,7 @@ async def run_agent_loop(
     task = load_task(task_path)
     run_id = str(uuid.uuid4())
     events = EventWriter(store)
-    now = time.time()
+    started_at = time.time()
 
     await store.execute(
         """
@@ -63,7 +92,7 @@ async def run_agent_loop(
             provider_name,
             model,
             config_hash(provider_name, model, str(task_path)),
-            now,
+            started_at,
         ),
     )
 
@@ -86,137 +115,151 @@ async def run_agent_loop(
     stop_reason = "max_steps"
     status = "completed"
 
-    while step < max_steps:
-        await events.append(
-            run_id,
-            step,
-            "model_request",
-            time.time(),
-            json.dumps({"step": step, "message_count": len(messages)}),
-        )
-
-        max_tok = task.get("max_tokens", 8192)
-        turn = await provider.complete(messages, tools=TOOL_SCHEMAS, max_tokens=max_tok)
-        usage_norm = normalise_openai_usage(turn.usage)
-        req_body = {"messages": messages, "tools": bool(TOOL_SCHEMAS)}
-        await store.execute(
-            """
-            INSERT INTO model_calls (
-                run_id, step, attempt, input_total, cached_read, cache_write, uncached,
-                output, reasoning, stop_reason, latency_ms, request_sha256, http_status, request_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+    try:
+        while step < max_steps:
+            await events.append(
                 run_id,
                 step,
-                1,
-                usage_norm["input_total"],
-                usage_norm["cached_read"],
-                usage_norm["cache_write"],
-                usage_norm["uncached"],
-                usage_norm["output"],
-                usage_norm["reasoning"],
-                turn.finish_reason,
-                turn.latency_ms,
-                request_sha256(req_body),
-                turn.http_status,
-                turn.request_id,
-            ),
-        )
+                "model_request",
+                time.time(),
+                json.dumps({"step": step, "message_count": len(messages)}),
+            )
 
-        assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
-        if turn.reasoning_content:
-            assistant_msg["reasoning_content"] = turn.reasoning_content
-        if turn.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {"name": tc.name, "arguments": tc.arguments},
-                }
-                for tc in turn.tool_calls
-            ]
-        messages.append(assistant_msg)
+            max_tok = task.get("max_tokens", 8192)
+            est_in = estimate_chat_input_tokens(messages, TOOL_SCHEMAS)
+            try:
+                turn = await provider.complete(
+                    messages,
+                    tools=TOOL_SCHEMAS,
+                    max_tokens=max_tok,
+                    estimated_input_tokens=est_in,
+                )
+            except TokenCapReached:
+                stop_reason = "token_cap"
+                status = "failed"
+                break
 
-        await events.append(
-            run_id,
-            step,
-            "model_response",
-            time.time(),
-            json.dumps({"finish_reason": turn.finish_reason, "tool_calls": len(turn.tool_calls)}),
-        )
-
-        if turn.http_status >= 400:
-            stop_reason = "provider_error"
-            status = "failed"
-            break
-
-        if not turn.tool_calls:
-            stop_reason = turn.finish_reason or "stop"
-            break
-
-        for tc in turn.tool_calls:
-            norm = normalise_tool_name(tc.name)
-            args_sha = hashlib.sha256(tc.arguments.encode()).hexdigest()
-            result, exit_code, duration_ms = await execute_tool(norm, tc.arguments)
-            out_text = json.dumps(result, ensure_ascii=False)
+            usage_norm = normalise_openai_usage(turn.usage)
+            req_body = {"messages": messages, "tools": TOOL_SCHEMAS}
             await store.execute(
                 """
-                INSERT INTO tool_calls (
-                    run_id, step, call_id, raw_name, norm_name, args_sha256, status,
-                    exit_code, duration_ms, output_tokens, truncated
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO model_calls (
+                    run_id, step, attempt, input_total, cached_read, cache_write, uncached,
+                    output, reasoning, stop_reason, latency_ms, request_sha256, http_status,
+                    request_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     step,
-                    tc.id,
-                    tc.name,
-                    norm,
-                    args_sha,
-                    "ok" if exit_code == 0 else "error",
-                    exit_code,
-                    duration_ms,
-                    max(1, len(out_text) // 4),
-                    0,
+                    1,
+                    usage_norm["input_total"],
+                    usage_norm["cached_read"],
+                    usage_norm["cache_write"],
+                    usage_norm["uncached"],
+                    usage_norm["output"],
+                    usage_norm["reasoning"],
+                    turn.finish_reason,
+                    turn.latency_ms,
+                    request_sha256(req_body),
+                    turn.http_status,
+                    turn.request_id,
                 ),
             )
+
+            assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
+            if turn.reasoning_content:
+                assistant_msg["reasoning_content"] = turn.reasoning_content
+            if turn.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.name, "arguments": tc.arguments},
+                    }
+                    for tc in turn.tool_calls
+                ]
+            messages.append(assistant_msg)
+
+            resp_payload = {
+                "finish_reason": turn.finish_reason,
+                "tool_calls": len(turn.tool_calls),
+            }
             await events.append(
                 run_id,
                 step,
-                "tool_call",
+                "model_response",
                 time.time(),
-                json.dumps({"call_id": tc.id, "name": norm}),
-            )
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": out_text,
-                }
-            )
-            await events.append(
-                run_id,
-                step,
-                "tool_result",
-                time.time(),
-                json.dumps({"call_id": tc.id, "exit_code": exit_code}),
+                json.dumps(resp_payload),
             )
 
-        step += 1
-    else:
-        status = "failed"
+            if turn.http_status >= 400:
+                stop_reason = "provider_error"
+                status = "failed"
+                break
 
-    ended = time.time()
-    await store.execute(
-        "UPDATE runs SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
-        (status, stop_reason, ended, run_id),
-    )
-    await events.append(
-        run_id,
-        step,
-        "run_finished",
-        time.time(),
-        json.dumps({"status": status, "stop_reason": stop_reason}),
-    )
+            if not turn.tool_calls:
+                stop_reason = turn.finish_reason or "stop"
+                break
+
+            for tc in turn.tool_calls:
+                norm = normalise_tool_name(tc.name)
+                args_sha = hashlib.sha256(tc.arguments.encode()).hexdigest()
+                await events.append(
+                    run_id,
+                    step,
+                    "tool_call",
+                    time.time(),
+                    json.dumps({"call_id": tc.id, "name": norm}),
+                )
+                try:
+                    result, exit_code, duration_ms = await execute_tool(norm, tc.arguments)
+                except Exception as exc:
+                    result = {"error": f"tool execution failed: {exc}", "is_error": True}
+                    exit_code = 1
+                    duration_ms = 0
+
+                out_text = json.dumps(result, ensure_ascii=False)
+                await store.execute(
+                    """
+                    INSERT INTO tool_calls (
+                        run_id, step, call_id, raw_name, norm_name, args_sha256, status,
+                        exit_code, duration_ms, output_tokens, truncated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        step,
+                        tc.id,
+                        tc.name,
+                        norm,
+                        args_sha,
+                        "ok" if exit_code == 0 else "error",
+                        exit_code,
+                        duration_ms,
+                        max(1, len(out_text) // 4),
+                        0,
+                    ),
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": out_text,
+                    }
+                )
+                await events.append(
+                    run_id,
+                    step,
+                    "tool_result",
+                    time.time(),
+                    json.dumps({"call_id": tc.id, "exit_code": exit_code}),
+                )
+
+            step += 1
+        else:
+            status = "failed"
+    finally:
+        await _finalize_run(store, events, run_id, step, status, stop_reason, started_at)
+
     return run_id

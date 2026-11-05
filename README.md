@@ -4,6 +4,34 @@
 
 An observable, measurable coding-agent harness, rebuilt in Python 3.11 asyncio using learn-claude-code as the mechanism reference, with events, usage accounting and SWE-bench evaluation built in from the first phase.
 
+## CLI（T0）
+
+安装：`pip install -e ".[dev]"`
+
+```bash
+# 离线 fake 任务（写入 .harness/harness.db）
+harness run --provider fake --task tests/fixtures/echo_task.json
+
+# 指标表（来自 store，非临时计算）
+harness report <run_id>
+
+# DeepSeek 连通性（401 亦视为 reachable；RUN_LIVE=1 且存在 DEEPSEEK_API_KEY 时走 ledger 做一次认证探测）
+harness net-check
+```
+
+本地状态与用量：
+
+- `.harness/harness.db` — SQLite WAL 运行库（已在 `.gitignore`）
+- `.harness/usage_ledger.jsonl` — 跨进程 token 账本（200k 硬顶，git 忽略）
+
+测试：
+
+```bash
+pytest -q tests/unit
+RUN_LIVE=1 pytest -q tests/live -m live   # 需要 DEEPSEEK_API_KEY
+ruff check probe_harness tests
+```
+
 ## 文档 / Docs
 - `docs/DECISIONS.md` — binding decisions (provider, key, 200k token cap per task, scope).
 - `docs/PLAN.md` — design: principles, architecture, data model, loop, phases, eval protocol.

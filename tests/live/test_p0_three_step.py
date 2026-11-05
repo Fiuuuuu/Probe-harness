@@ -10,6 +10,8 @@ from probe_harness.providers.ledger import UsageLedger
 from probe_harness.providers.openai_chat import OpenAIChatProvider
 from probe_harness.store.db import Store
 
+pytestmark = pytest.mark.live
+
 
 @pytest.mark.asyncio
 async def test_three_step_tool_task_live(tmp_path: Path) -> None:
@@ -29,25 +31,33 @@ async def test_three_step_tool_task_live(tmp_path: Path) -> None:
         max_tokens=512,
         test_run_id="live-three-step",
     )
-    run_id = await run_agent_loop(
-        store,
-        provider,
-        task,
-        provider_name="deepseek",
-        model="deepseek-flash",
-        max_steps=8,
-    )
+    try:
+        run_id = await run_agent_loop(
+            store,
+            provider,
+            task,
+            provider_name="deepseek",
+            model="deepseek-flash",
+            max_steps=8,
+        )
+    finally:
+        await provider.aclose()
 
-    calls = await store.fetchall(
-        "SELECT input_total, output, uncached FROM model_calls WHERE run_id = ?",
+    run = await store.fetchone("SELECT status, stop_reason FROM runs WHERE id = ?", (run_id,))
+    assert run is not None
+    assert run["status"] == "completed"
+
+    model_calls = await store.fetchall(
+        "SELECT input_total, output FROM model_calls WHERE run_id = ?",
         (run_id,),
     )
-    assert len(calls) >= 1
-    total_in = sum(c["input_total"] for c in calls)
-    total_out = sum(c["output"] for c in calls)
+    assert len(model_calls) >= 1
+    total_in = sum(c["input_total"] for c in model_calls)
+    total_out = sum(c["output"] for c in model_calls)
     assert total_in + total_out > 0
 
-    assert calls[0]["input_total"] > 0
+    tool_rows = await store.fetchall("SELECT * FROM tool_calls WHERE run_id = ?", (run_id,))
+    assert len(tool_rows) >= 3
 
     print(f"ledger_cumulative_tokens={ledger.total_tokens_used()}")
     await store.close()
