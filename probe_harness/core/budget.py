@@ -89,6 +89,7 @@ class RunBudget:
     tokens_level: Level = "normal"
     calls_level: Level = "normal"
     finalization_appended: bool = False
+    finalization_wrap_up_pending: bool = False
 
     @property
     def combined_level(self) -> Level:
@@ -106,6 +107,7 @@ class RunBudget:
             "calls_level": self.calls_level,
             "combined_level": self.combined_level,
             "finalization_appended": self.finalization_appended,
+            "finalization_wrap_up_pending": self.finalization_wrap_up_pending,
         }
 
     @classmethod
@@ -116,6 +118,7 @@ class RunBudget:
         rb.tokens_level = str(data.get("tokens_level", "normal"))
         rb.calls_level = str(data.get("calls_level", "normal"))
         rb.finalization_appended = bool(data.get("finalization_appended", False))
+        rb.finalization_wrap_up_pending = bool(data.get("finalization_wrap_up_pending", False))
         return rb
 
     def _tokens_level_for(self, chargeable: int) -> Level:
@@ -144,10 +147,14 @@ class RunBudget:
         if new_t != self.tokens_level:
             transitions.append(BudgetTransition("tokens", self.tokens_level, new_t))
             self.tokens_level = new_t
+            if new_t == "finalizing":
+                self.finalization_wrap_up_pending = True
         new_c = self._calls_level_for(self.model_calls)
         if new_c != self.calls_level:
             transitions.append(BudgetTransition("calls", self.calls_level, new_c))
             self.calls_level = new_c
+            if new_c == "finalizing":
+                self.finalization_wrap_up_pending = True
         return transitions
 
     def check_before_model_call(self) -> tuple[bool, str | None]:
@@ -181,7 +188,11 @@ class RunBudget:
     def ensure_finalization_user_message(
         self, messages: list[dict[str, Any]], task: dict[str, Any]
     ) -> bool:
-        if self.finalization_appended or self.combined_level != "finalizing":
+        if (
+            self.finalization_appended
+            or not self.finalization_wrap_up_pending
+            or self.combined_level != "finalizing"
+        ):
             return False
         messages.append({"role": "user", "content": self.finalization_user_text(task)})
         self.finalization_appended = True

@@ -364,9 +364,12 @@ async def run_agent_loop(
 
     script = task.get("fake_script") or []
     budget_limits = BudgetLimits.from_task(task)
-    run_budget: RunBudget | None = (
-        RunBudget(limits=budget_limits) if budget_limits is not None else None
-    )
+    run_budget: RunBudget | None = None
+    if budget_limits is not None:
+        if recovery_ctx is not None and recovery_ctx.budget_state:
+            run_budget = RunBudget.from_dict(budget_limits, recovery_ctx.budget_state)
+        else:
+            run_budget = RunBudget(limits=budget_limits)
     repeat_guard = RepeatedCallGuard()
     cache_prefix_ref: str | None = None
     name_map = ToolNameMap()
@@ -377,7 +380,8 @@ async def run_agent_loop(
         if not isinstance(provider, FakeProvider):
             provider = FakeProvider(script, start_index=fake_script_index)
         else:
-            provider = FakeProvider(script, start_index=fake_script_index)
+            provider._script = list(script)
+            provider._index = fake_script_index
 
     stop_reason = "max_steps"
     status = "completed"
@@ -670,10 +674,28 @@ async def run_agent_loop(
 
                 assert turn is not None
                 if not turn.tool_calls:
+                    if (
+                        run_budget is not None
+                        and run_budget.finalization_wrap_up_pending
+                        and not run_budget.finalization_appended
+                    ):
+                        run_budget.ensure_finalization_user_message(messages, task)
+                        step += 1
+                        continue
+                    if (
+                        run_budget is not None
+                        and run_budget.finalization_wrap_up_pending
+                        and run_budget.finalization_appended
+                    ):
+                        run_budget.finalization_wrap_up_pending = False
                     stop_reason = turn.finish_reason or "stop"
                     break
 
-                if run_budget is not None and run_budget.combined_level == "finalizing":
+                if (
+                    run_budget is not None
+                    and run_budget.finalization_appended
+                    and run_budget.finalization_wrap_up_pending
+                ):
                     await _synthetic_tool_results_for_policy(
                         messages,
                         events,
@@ -683,6 +705,7 @@ async def run_agent_loop(
                         reason="run budget finalization",
                         kind="budget_finalization",
                     )
+                    run_budget.finalization_wrap_up_pending = False
                     status = "failed"
                     stop_reason = "run_budget"
                     break
