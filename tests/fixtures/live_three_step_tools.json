@@ -1,0 +1,7 @@
+{
+  "system": "You are a concise agent. Always use the requested tools before answering.",
+  "user_message": "Step 1: use bash to run `echo step1`. Step 2: use bash to run `echo step2`. Step 3: use bash to run `echo step3`. Then say finished in plain text.",
+  "thinking_enabled": true,
+  "max_tokens": 512,
+  "max_steps": 8
+}

@@ -19,6 +19,6 @@ htmlcov/
 *.sqlite3
 *.db-wal
 *.db-shm
-runs/
+/runs/
 logs/
 predictions/
