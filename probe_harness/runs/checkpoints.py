@@ -35,7 +35,12 @@ async def save_checkpoint(
     messages: list[dict[str, Any]],
     meta: dict[str, Any] | None = None,
 ) -> None:
-    usage_json = json.dumps(meta or {}, ensure_ascii=False)
+    meta_dict = meta or {}
+    usage_json = json.dumps(meta_dict, ensure_ascii=False)
+    budget_payload = meta_dict.get("budget")
+    if budget_payload is None:
+        budget_payload = meta_dict.get("hook_metrics") or {}
+    budget_json = json.dumps(budget_payload, ensure_ascii=False)
     await store.execute(
         """
         INSERT INTO checkpoints (run_id, step, boundary, messages_json, usage_json, budget_json)
@@ -43,7 +48,7 @@ async def save_checkpoint(
         ON CONFLICT(run_id, step, boundary) DO UPDATE SET
             messages_json = excluded.messages_json,
             usage_json = excluded.usage_json,
-            budget_json = excluded.usage_json
+            budget_json = excluded.budget_json
         """,
         (
             run_id,
@@ -51,7 +56,7 @@ async def save_checkpoint(
             boundary,
             json.dumps(messages, ensure_ascii=False),
             usage_json,
-            usage_json,
+            budget_json,
         ),
     )
     await events.append(

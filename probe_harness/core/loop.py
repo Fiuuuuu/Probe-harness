@@ -30,9 +30,12 @@ from probe_harness.providers.usage import estimate_chat_input_tokens
 from probe_harness.runs.checkpoints import checkpoint_meta, save_checkpoint
 from probe_harness.runs.journal import (
     JOURNAL_COMPLETED,
+    JOURNAL_STARTED,
+    JOURNAL_UNCERTAIN,
     journal_lookup,
     journal_mark_completed,
     journal_mark_started,
+    journal_mark_uncertain,
     uncertain_tool_result,
 )
 from probe_harness.runs.recovery import RecoveryContext, recover_run
@@ -213,7 +216,9 @@ class SimulatedHardKill(Exception):
     """Test-only stand-in for SIGKILL (skips ``finally`` only when using ``os._exit``)."""
 
 
-def _maybe_hard_kill(task: dict[str, Any], when: str) -> None:
+def _maybe_hard_kill(task: dict[str, Any], task_path: Path, when: str) -> None:
+    if not _allow_task_test_controls(task_path):
+        return
     target = task.get("simulate_hard_kill_at")
     if target == when:
         if task.get("simulate_hard_kill_use_exit"):
@@ -392,7 +397,7 @@ async def run_agent_loop(
                         messages=messages,
                         meta=checkpoint_meta(fake_script_index=fake_idx),
                     )
-                    _maybe_hard_kill(task, CHECKPOINT_PRE_MODEL)
+                    _maybe_hard_kill(task, task_path, CHECKPOINT_PRE_MODEL)
 
                     est_in = estimate_chat_input_tokens(provider_messages, api_tools)
                     use_stream = bool(task.get("stream", False)) and provider_name == "deepseek"
@@ -647,6 +652,53 @@ async def run_agent_loop(
                             ),
                         )
                         continue
+                    if prior is not None and prior["status"] in {
+                        JOURNAL_STARTED,
+                        JOURNAL_UNCERTAIN,
+                    }:
+                        result = uncertain_tool_result(
+                            tc.id,
+                            reason="interrupted before completion; side effect not replayed",
+                        )
+                        await journal_mark_uncertain(
+                            store,
+                            lineage_run_id=lineage_run_id,
+                            run_id=run_id,
+                            call_id=tc.id,
+                        )
+                        await events.append(
+                            run_id,
+                            step,
+                            "protocol_repair",
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "kind": "journal_no_replay",
+                                    "tool_call_id": tc.id,
+                                    "journal_status": prior["status"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                        out_text = json.dumps(result, ensure_ascii=False)
+                        messages.append(
+                            {"role": "tool", "tool_call_id": tc.id, "content": out_text}
+                        )
+                        await events.append(
+                            run_id,
+                            step,
+                            "tool_result",
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "call_id": tc.id,
+                                    "synthetic": True,
+                                    "outcome_uncertain": True,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                        continue
                     try:
                         await bus.emit(
                             HookEvent(
@@ -696,7 +748,7 @@ async def run_agent_loop(
                         norm_name=norm,
                         args_sha256=args_sha,
                     )
-                    _maybe_hard_kill(task, "during_tool")
+                    _maybe_hard_kill(task, task_path, "during_tool")
                     try:
                         result, exit_code, duration_ms = await execute_tool(
                             raw_name,
@@ -716,7 +768,6 @@ async def run_agent_loop(
                         args_sha256=args_sha,
                         result=result,
                     )
-                    _maybe_hard_kill(task, CHECKPOINT_POST_TOOLS)
 
                     out_text = json.dumps(result, ensure_ascii=False)
                     try:
@@ -755,6 +806,7 @@ async def run_agent_loop(
                     messages=messages,
                     meta=checkpoint_meta(fake_script_index=fake_script_index),
                 )
+                _maybe_hard_kill(task, task_path, CHECKPOINT_POST_TOOLS)
 
                 step += 1
             except TokenCapReached as cap:

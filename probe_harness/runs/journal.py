@@ -11,6 +11,7 @@ from probe_harness.store.db import Store
 
 JOURNAL_STARTED = "started"
 JOURNAL_COMPLETED = "completed"
+JOURNAL_UNCERTAIN = "uncertain"
 
 
 async def resolve_lineage_run_id(store: Store, run_id: str) -> str:
@@ -89,6 +90,23 @@ async def journal_mark_completed(
             json.dumps(result, ensure_ascii=False),
             time.time(),
         ),
+    )
+
+
+async def journal_mark_uncertain(
+    store: Store,
+    *,
+    lineage_run_id: str,
+    run_id: str,
+    call_id: str,
+) -> None:
+    await store.execute(
+        """
+        UPDATE tool_journal
+        SET status = ?, run_id = ?, ts = ?
+        WHERE lineage_run_id = ? AND call_id = ?
+        """,
+        (JOURNAL_UNCERTAIN, run_id, time.time(), lineage_run_id, call_id),
     )
 
 
