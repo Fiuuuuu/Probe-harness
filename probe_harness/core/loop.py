@@ -12,16 +12,17 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from probe_harness.core.context import prepare_context
-from probe_harness.core.hooks import HookBus, HookEvent, HookName, default_hook_bus
+from probe_harness.core.hooks import (
+    HookBus,
+    HookEvent,
+    HookHandlerError,
+    HookName,
+    ensure_metric_hooks,
+)
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
 from probe_harness.providers.guards import is_truncated_turn
 from probe_harness.providers.ledger import TokenCapReached
-from probe_harness.providers.openai_chat import request_sha256
-from probe_harness.providers.usage import (
-    estimate_chat_input_tokens,
-    normalise_anthropic_usage,
-    normalise_openai_usage,
-)
+from probe_harness.providers.usage import estimate_chat_input_tokens
 from probe_harness.store.db import EventWriter, Store
 from probe_harness.tools.names import ToolNameMap, denormalise_tool_name, normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS, execute_tool
@@ -45,15 +46,8 @@ def config_hash(provider: str, model: str, task_path: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _normalise_usage(provider_name: str, usage: dict[str, Any]) -> dict[str, int]:
-    if provider_name == "fake" or provider_name == "deepseek":
-        return normalise_openai_usage(usage)
-    if provider_name == "anthropic" or provider_name.endswith("-anthropic"):
-        return normalise_anthropic_usage(usage)
-    raise ValueError(f"unknown provider for usage normalisation: {provider_name!r}")
-
-
-async def _persist_model_calls(
+async def _emit_model_call_metrics(
+    bus: HookBus,
     store: Store,
     *,
     run_id: str,
@@ -71,38 +65,22 @@ async def _persist_model_calls(
         "tools": TOOL_SCHEMAS,
         "max_tokens": max_tok,
     }
-    req_hash = request_sha256(req_body)
-    for call_row in call_rows:
-        row_usage = _normalise_usage(provider_name, call_row.usage)
-        stop = call_row.stop_reason or turn.finish_reason
-        if call_row.usage_estimated:
-            stop = f"{stop}|usage_estimated"
-        await store.execute(
-            """
-            INSERT INTO model_calls (
-                run_id, step, attempt, input_total, cached_read, cache_write,
-                uncached, output, reasoning, stop_reason, latency_ms,
-                request_sha256, http_status, request_id, response_model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
+    try:
+        await bus.emit(
+            HookEvent(
+                HookName.POST_MODEL_CALL,
                 run_id,
                 step,
-                call_row.attempt,
-                row_usage["input_total"],
-                row_usage["cached_read"],
-                row_usage["cache_write"],
-                row_usage["uncached"],
-                row_usage["output"],
-                row_usage["reasoning"],
-                stop,
-                call_row.latency_ms,
-                req_hash,
-                call_row.http_status,
-                call_row.request_id,
-                call_row.response_model or turn.response_model,
-            ),
+                {
+                    "provider_name": provider_name,
+                    "turn": turn,
+                    "call_rows": call_rows,
+                    "req_body": req_body,
+                },
+            )
         )
+    except HookHandlerError as err:
+        raise err.errors[0] from err
 
 
 def _provider_error_payload(turn: Any, call_rows: list[HttpCallRecord]) -> dict[str, Any]:
@@ -129,27 +107,41 @@ async def _finalize_run(
     hook_bus: HookBus | None = None,
     error_detail: dict[str, Any] | None = None,
 ) -> None:
+    hook_errors: list[str] = []
     if hook_bus is not None:
-        await hook_bus.emit(
-            HookEvent(
-                HookName.STOP,
-                run_id,
-                step,
-                {"status": status, "stop_reason": stop_reason},
+        try:
+            await hook_bus.emit(
+                HookEvent(
+                    HookName.STOP,
+                    run_id,
+                    step,
+                    {"status": status, "stop_reason": stop_reason},
+                )
             )
-        )
+        except HookHandlerError as err:
+            hook_errors.extend(str(e) for e in err.errors)
+        except Exception as exc:
+            hook_errors.append(str(exc))
+
     ended = time.time()
+    final_status = status
+    final_reason = stop_reason
+    if hook_errors and final_status == "running":
+        final_status = "failed"
+        final_reason = "hook_error"
     await store.execute(
         "UPDATE runs SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
-        (status, stop_reason, ended, run_id),
+        (final_status, final_reason, ended, run_id),
     )
     payload: dict[str, Any] = {
-        "status": status,
-        "stop_reason": stop_reason,
+        "status": final_status,
+        "stop_reason": final_reason,
         "agent_time_s": ended - started_at,
     }
     if error_detail:
         payload["provider_error"] = error_detail
+    if hook_errors:
+        payload["hook_errors"] = hook_errors
     await events.append(
         run_id,
         step,
@@ -186,7 +178,8 @@ async def run_agent_loop(
     task = load_task(task_path)
     run_id = str(uuid.uuid4())
     events = EventWriter(store)
-    bus = hook_bus if hook_bus is not None else default_hook_bus(store=store, events=events)
+    bus = hook_bus if hook_bus is not None else HookBus()
+    ensure_metric_hooks(bus, store=store, events=events)
     started_at = time.time()
 
     await store.execute(
@@ -334,7 +327,8 @@ async def run_agent_loop(
                     break
 
                 assert turn is not None
-                await _persist_model_calls(
+                await _emit_model_call_metrics(
+                    bus,
                     store,
                     run_id=run_id,
                     step=step,
@@ -482,19 +476,47 @@ async def run_agent_loop(
                         time.time(),
                         json.dumps({"call_id": tc.id, "name": norm}),
                     )
-                    await bus.emit(
-                        HookEvent(
-                            HookName.PRE_TOOL_USE,
+                    try:
+                        await bus.emit(
+                            HookEvent(
+                                HookName.PRE_TOOL_USE,
+                                run_id,
+                                step,
+                                {
+                                    "call_id": tc.id,
+                                    "raw_name": raw_name,
+                                    "norm_name": norm,
+                                    "arguments": tc.arguments,
+                                },
+                            )
+                        )
+                    except HookHandlerError as pre_err:
+                        interrupt = {
+                            "error": "tool call interrupted: pre_tool_use hook failed",
+                            "is_error": True,
+                        }
+                        await events.append(
                             run_id,
                             step,
-                            {
-                                "call_id": tc.id,
-                                "raw_name": raw_name,
-                                "norm_name": norm,
-                                "arguments": tc.arguments,
-                            },
+                            "protocol_repair",
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "kind": "pre_tool_use_hook_failed",
+                                    "tool_call_id": tc.id,
+                                    "reason": str(pre_err.errors[0]),
+                                },
+                                ensure_ascii=False,
+                            ),
                         )
-                    )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": json.dumps(interrupt, ensure_ascii=False),
+                            }
+                        )
+                        raise pre_err.errors[0] from pre_err
                     try:
                         result, exit_code, duration_ms = await execute_tool(
                             raw_name,
@@ -506,22 +528,25 @@ async def run_agent_loop(
                         duration_ms = 0
 
                     out_text = json.dumps(result, ensure_ascii=False)
-                    await bus.emit(
-                        HookEvent(
-                            HookName.POST_TOOL_USE,
-                            run_id,
-                            step,
-                            {
-                                "call_id": tc.id,
-                                "raw_name": raw_name,
-                                "norm_name": norm,
-                                "args_sha256": args_sha,
-                                "result": result,
-                                "exit_code": exit_code,
-                                "duration_ms": duration_ms,
-                            },
+                    try:
+                        await bus.emit(
+                            HookEvent(
+                                HookName.POST_TOOL_USE,
+                                run_id,
+                                step,
+                                {
+                                    "call_id": tc.id,
+                                    "raw_name": raw_name,
+                                    "norm_name": norm,
+                                    "args_sha256": args_sha,
+                                    "result": result,
+                                    "exit_code": exit_code,
+                                    "duration_ms": duration_ms,
+                                },
+                            )
                         )
-                    )
+                    except HookHandlerError as post_err:
+                        raise post_err.errors[0] from post_err
                     messages.append(
                         {
                             "role": "tool",
@@ -537,7 +562,8 @@ async def run_agent_loop(
                 extra_calls = getattr(cap, "http_calls", None) or []
                 if extra_calls:
                     stub_turn = ModelTurn(content=None, finish_reason="token_cap", http_status=0)
-                    await _persist_model_calls(
+                    await _emit_model_call_metrics(
+                        bus,
                         store,
                         run_id=run_id,
                         step=step,
@@ -559,7 +585,8 @@ async def run_agent_loop(
                     error_body=str(pce)[:800],
                 )
                 if pce.http_calls:
-                    await _persist_model_calls(
+                    await _emit_model_call_metrics(
+                        bus,
                         store,
                         run_id=run_id,
                         step=step,

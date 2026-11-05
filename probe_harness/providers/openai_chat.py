@@ -262,6 +262,7 @@ class OpenAIChatProvider:
         stream: bool,
         tool_choice: Any | None = None,
         stream_include_usage: bool = True,
+        include_thinking_param: bool = True,
     ) -> dict[str, Any]:
         thinking_param = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
         wire_messages = strip_reasoning_for_wire(
@@ -272,11 +273,12 @@ class OpenAIChatProvider:
             "model": self.model,
             "messages": wire_messages,
             "max_tokens": max_tokens,
-            "thinking": thinking_param,
             "stream": stream,
         }
-        if thinking_enabled:
-            body["reasoning_effort"] = self.reasoning_effort
+        if include_thinking_param:
+            body["thinking"] = thinking_param
+            if thinking_enabled:
+                body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
         if tool_choice is not None:
@@ -747,6 +749,7 @@ class OpenAIChatProvider:
         stream: bool = False,
         tool_choice: Any | None = None,
         stream_include_usage: bool = True,
+        include_thinking_param: bool = True,
     ) -> ModelTurn:
         mtoks = max_tokens if max_tokens is not None else self.max_tokens
         think = self.thinking_enabled if thinking_enabled is None else thinking_enabled
@@ -758,6 +761,7 @@ class OpenAIChatProvider:
             stream=stream,
             tool_choice=tool_choice,
             stream_include_usage=stream_include_usage,
+            include_thinking_param=include_thinking_param,
         )
         self.last_request_bodies.append(scrub_request_body(body))
         est_in = (
