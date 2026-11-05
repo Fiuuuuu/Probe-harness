@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from probe_harness.store.db import Store
 
 
@@ -9,6 +11,23 @@ async def run_metrics(store: Store, run_id: str) -> dict | None:
     run = await store.fetchone("SELECT * FROM runs WHERE id = ?", (run_id,))
     if run is None:
         return None
+
+    hook_row = await store.fetchone(
+        """
+        SELECT data_json FROM events
+        WHERE run_id = ? AND type = 'budget_state'
+        ORDER BY seq DESC LIMIT 1
+        """,
+        (run_id,),
+    )
+    hook_tool_calls: int | None = None
+    if hook_row:
+        try:
+            hook_tool_calls = (
+                json.loads(hook_row["data_json"]).get("metrics_from_hooks", {}).get("tool_calls")
+            )
+        except json.JSONDecodeError:
+            hook_tool_calls = None
 
     rows = await store.fetchall(
         """
@@ -42,6 +61,7 @@ async def run_metrics(store: Store, run_id: str) -> dict | None:
         "cache_ratio_pct": cache_ratio,
         "stop_reason": stop_reason,
         "agent_time_s": agent_time_s,
+        "hook_tool_calls": hook_tool_calls,
     }
 
 

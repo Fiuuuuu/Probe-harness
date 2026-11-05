@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from probe_harness.core.context import prepare_context
+from probe_harness.core.hooks import HookBus, HookEvent, HookName, default_hook_bus
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
 from probe_harness.providers.guards import is_truncated_turn
 from probe_harness.providers.ledger import TokenCapReached
@@ -125,8 +126,18 @@ async def _finalize_run(
     stop_reason: str,
     started_at: float,
     *,
+    hook_bus: HookBus | None = None,
     error_detail: dict[str, Any] | None = None,
 ) -> None:
+    if hook_bus is not None:
+        await hook_bus.emit(
+            HookEvent(
+                HookName.STOP,
+                run_id,
+                step,
+                {"status": status, "stop_reason": stop_reason},
+            )
+        )
     ended = time.time()
     await store.execute(
         "UPDATE runs SET status = ?, stop_reason = ?, ended_at = ? WHERE id = ?",
@@ -170,10 +181,12 @@ async def run_agent_loop(
     provider_name: str = "fake",
     model: str = "fake",
     max_steps: int = 20,
+    hook_bus: HookBus | None = None,
 ) -> str:
     task = load_task(task_path)
     run_id = str(uuid.uuid4())
     events = EventWriter(store)
+    bus = hook_bus if hook_bus is not None else default_hook_bus(store=store, events=events)
     started_at = time.time()
 
     await store.execute(
@@ -469,6 +482,19 @@ async def run_agent_loop(
                         time.time(),
                         json.dumps({"call_id": tc.id, "name": norm}),
                     )
+                    await bus.emit(
+                        HookEvent(
+                            HookName.PRE_TOOL_USE,
+                            run_id,
+                            step,
+                            {
+                                "call_id": tc.id,
+                                "raw_name": raw_name,
+                                "norm_name": norm,
+                                "arguments": tc.arguments,
+                            },
+                        )
+                    )
                     try:
                         result, exit_code, duration_ms = await execute_tool(
                             raw_name,
@@ -480,26 +506,21 @@ async def run_agent_loop(
                         duration_ms = 0
 
                     out_text = json.dumps(result, ensure_ascii=False)
-                    await store.execute(
-                        """
-                        INSERT INTO tool_calls (
-                            run_id, step, call_id, raw_name, norm_name, args_sha256, status,
-                            exit_code, duration_ms, output_tokens, truncated
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
+                    await bus.emit(
+                        HookEvent(
+                            HookName.POST_TOOL_USE,
                             run_id,
                             step,
-                            tc.id,
-                            raw_name,
-                            norm,
-                            args_sha,
-                            "ok" if exit_code == 0 else "error",
-                            exit_code,
-                            duration_ms,
-                            max(1, len(out_text) // 4),
-                            0,
-                        ),
+                            {
+                                "call_id": tc.id,
+                                "raw_name": raw_name,
+                                "norm_name": norm,
+                                "args_sha256": args_sha,
+                                "result": result,
+                                "exit_code": exit_code,
+                                "duration_ms": duration_ms,
+                            },
+                        )
                     )
                     messages.append(
                         {
@@ -507,13 +528,6 @@ async def run_agent_loop(
                             "tool_call_id": tc.id,
                             "content": out_text,
                         }
-                    )
-                    await events.append(
-                        run_id,
-                        step,
-                        "tool_result",
-                        time.time(),
-                        json.dumps({"call_id": tc.id, "exit_code": exit_code}),
                     )
 
                 step += 1
@@ -583,6 +597,7 @@ async def run_agent_loop(
             status,
             stop_reason,
             started_at,
+            hook_bus=bus,
             error_detail=error_detail,
         )
 
