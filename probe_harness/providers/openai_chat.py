@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError, ToolCallSpec
+from probe_harness.providers.guards import merge_system_messages_openai, strip_reasoning_for_wire
 from probe_harness.providers.ledger import TokenCapReached, UsageLedger
 from probe_harness.providers.usage import estimate_chat_input_tokens, normalise_openai_usage
 
@@ -47,14 +48,36 @@ def scrub_request_body(body: dict[str, Any]) -> dict[str, Any]:
     return scrub(body)
 
 
+_REDACTED_THINKING_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def extract_reasoning_content(message: dict[str, Any]) -> str | None:
+    """C5: normalise reasoning from DeepSeek / gateway message shapes."""
+    for key in ("reasoning_content", "reasoning", "reasoning_text"):
+        val = message.get(key)
+        if isinstance(val, str) and val:
+            return val
+    content = message.get("content")
+    if isinstance(content, str):
+        match = _REDACTED_THINKING_RE.search(content)
+        if match:
+            return match.group(1)
+    return None
+
+
 def request_sha256(body: dict[str, Any]) -> str:
     scrubbed = scrub_request_body(body)
     raw = json.dumps(scrubbed, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(raw).hexdigest()
 
 
-def _request_id(resp: httpx.Response) -> str | None:
-    return resp.headers.get("x-request-id") or resp.headers.get("X-Request-Id")
+def _request_id(resp: httpx.Response, data: dict[str, Any] | None = None) -> str | None:
+    rid = resp.headers.get("x-request-id") or resp.headers.get("X-Request-Id")
+    if rid:
+        return rid
+    if data and data.get("id"):
+        return str(data["id"])
+    return None
 
 
 def error_body_from_text(text: str) -> str:
@@ -135,6 +158,8 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
     usage_raw: dict[str, Any] = {}
     finish_reason = "stop"
     http_status = 200
+    response_model: str | None = None
+    request_id: str | None = None
 
     for line in lines:
         line = line.strip()
@@ -147,6 +172,10 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
             chunk = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if chunk.get("model"):
+            response_model = str(chunk["model"])
+        if chunk.get("id") and request_id is None:
+            request_id = str(chunk["id"])
         if chunk.get("usage"):
             usage_raw = chunk["usage"]
         for choice in chunk.get("choices") or []:
@@ -162,6 +191,8 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
     tool_calls = assemble_stream_tool_calls(tool_deltas)
     content = "".join(content_parts) or None
     reasoning = "".join(reasoning_parts) or None
+    if not reasoning and content:
+        reasoning = extract_reasoning_content({"content": content})
     turn = ModelTurn(
         content=content,
         tool_calls=tool_calls,
@@ -169,6 +200,8 @@ def parse_sse_stream_payload(lines: list[str]) -> tuple[ModelTurn, dict[str, Any
         finish_reason=finish_reason,
         usage=usage_raw,
         http_status=http_status,
+        response_model=response_model,
+        request_id=request_id,
     )
     return turn, usage_raw
 
@@ -206,6 +239,8 @@ class OpenAIChatProvider:
         self.test_run_id = test_run_id
         self._client = client
         self._owns_client = client is None
+        self.last_assistant_message: dict[str, Any] = {}
+        self.last_request_bodies: list[dict[str, Any]] = []
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -225,11 +260,16 @@ class OpenAIChatProvider:
         max_tokens: int,
         thinking_enabled: bool,
         stream: bool,
+        tool_choice: Any | None = None,
     ) -> dict[str, Any]:
         thinking_param = {"type": "enabled"} if thinking_enabled else {"type": "disabled"}
+        wire_messages = strip_reasoning_for_wire(
+            merge_system_messages_openai(messages),
+            thinking_enabled=thinking_enabled,
+        )
         body: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": wire_messages,
             "max_tokens": max_tokens,
             "thinking": thinking_param,
             "stream": stream,
@@ -238,6 +278,8 @@ class OpenAIChatProvider:
             body["reasoning_effort"] = self.reasoning_effort
         if tools:
             body["tools"] = tools
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
         if stream:
             body["stream_options"] = {"include_usage": True}
         return body
@@ -273,15 +315,20 @@ class OpenAIChatProvider:
         finish_reason: str,
         *,
         error_body: str = "",
+        usage_estimated: bool = False,
+        response_model: str | None = None,
+        request_id: str | None = None,
     ) -> HttpCallRecord:
         return HttpCallRecord(
             attempt=attempt,
             usage=usage_raw,
             http_status=resp.status_code,
-            request_id=_request_id(resp),
+            request_id=request_id if request_id is not None else _request_id(resp, None),
             latency_ms=latency_ms,
             stop_reason=finish_reason,
             error_body=error_body,
+            usage_estimated=usage_estimated,
+            response_model=response_model,
         )
 
     async def _post_json(
@@ -361,8 +408,17 @@ class OpenAIChatProvider:
             choice = (data.get("choices") or [{}])[0]
             finish = choice.get("finish_reason") or "stop"
 
+        resp_model = str(data["model"]) if resp.status_code < 400 and data.get("model") else None
+        rid = _request_id(resp, data if data else None)
         record = self._http_call_record(
-            attempt, usage_raw, resp, latency_ms, finish, error_body=err_body
+            attempt,
+            usage_raw,
+            resp,
+            latency_ms,
+            finish,
+            error_body=err_body,
+            response_model=resp_model,
+            request_id=rid,
         )
         try:
             self._record_response_usage(
@@ -374,6 +430,8 @@ class OpenAIChatProvider:
 
         if resp.status_code < 400:
             turn = self._turn_from_json(data, resp, latency_ms)
+            record.response_model = turn.response_model
+            record.request_id = turn.request_id
             return turn, record, False, resp
 
         should_retry = _is_retryable_status(resp.status_code)
@@ -382,9 +440,10 @@ class OpenAIChatProvider:
             finish_reason="error",
             usage=usage_raw,
             http_status=resp.status_code,
-            request_id=_request_id(resp),
+            request_id=_request_id(resp, data),
             latency_ms=latency_ms,
             error_body=err_body,
+            response_model=str(data["model"]) if data.get("model") else None,
         )
         return turn, record, should_retry, resp
 
@@ -411,38 +470,53 @@ class OpenAIChatProvider:
             err_body = error_body_from_text(str(stream_result.stream_error))
             usage_raw = {}
             if stream_result.lines and received:
-                _parsed, usage_raw = parse_sse_stream_payload(stream_result.lines)
+                parsed_turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
+                stream_rid = parsed_turn.request_id
+            else:
+                stream_rid = None
             finish = "stream_interrupted"
+            estimated_usage = usage_raw
+            usage_estimated = False
+            if not self._usage_has_tokens(usage_raw):
+                estimated_usage = {
+                    "prompt_tokens": est_in,
+                    "completion_tokens": max_tokens,
+                }
+                usage_estimated = True
             try:
                 self._record_response_usage(
-                    usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
+                    estimated_usage, est_in=est_in, max_tokens=max_tokens, stream=True
                 )
             except TokenCapReached as cap:
                 record = self._http_call_record(
                     attempt,
-                    usage_raw,
+                    estimated_usage,
                     resp,
                     latency_ms,
                     finish,
                     error_body=err_body,
+                    usage_estimated=usage_estimated,
+                    request_id=stream_rid or _request_id(resp),
                 )
                 cap.pending_record = record  # type: ignore[attr-defined]
                 raise
             record = self._http_call_record(
                 attempt,
-                usage_raw,
+                estimated_usage,
                 resp,
                 latency_ms,
                 finish,
                 error_body=err_body,
+                usage_estimated=usage_estimated,
+                request_id=stream_rid or _request_id(resp),
             )
             turn = ModelTurn(
                 content=None,
                 tool_calls=[],
                 finish_reason="stream_interrupted",
-                usage=usage_raw,
+                usage=estimated_usage,
                 http_status=resp.status_code,
-                request_id=_request_id(resp),
+                request_id=stream_rid or _request_id(resp),
                 latency_ms=latency_ms,
                 error_body=err_body,
             )
@@ -452,10 +526,27 @@ class OpenAIChatProvider:
         if resp.status_code < 400:
             turn, usage_raw = parse_sse_stream_payload(stream_result.lines)
             turn.latency_ms = latency_ms
-            turn.request_id = _request_id(resp)
+            turn.request_id = turn.request_id or _request_id(resp)
             turn.http_status = resp.status_code
             finish = turn.finish_reason
-            record = self._http_call_record(attempt, usage_raw, resp, latency_ms, finish)
+            usage_estimated = False
+            if not self._usage_has_tokens(usage_raw):
+                usage_raw = {
+                    "prompt_tokens": est_in,
+                    "completion_tokens": max_tokens,
+                }
+                usage_estimated = True
+                turn.usage = usage_raw
+            record = self._http_call_record(
+                attempt,
+                usage_raw,
+                resp,
+                latency_ms,
+                finish,
+                response_model=turn.response_model,
+                usage_estimated=usage_estimated,
+                request_id=turn.request_id,
+            )
             try:
                 self._record_response_usage(
                     usage_raw, est_in=est_in, max_tokens=max_tokens, stream=True
@@ -466,25 +557,33 @@ class OpenAIChatProvider:
             return turn, record, False, resp
 
         err_body = error_body_from_response(resp)
+        err_data: dict[str, Any] = {}
         try:
             if resp.content:
                 err_data = json.loads(resp.content)
                 usage_raw = err_data.get("usage") or {}
         except (json.JSONDecodeError, ValueError):
-            pass
+            err_data = {}
         if usage_raw:
             self._record_response_usage(
                 usage_raw, est_in=est_in, max_tokens=max_tokens, stream=False
             )
         record = self._http_call_record(
-            attempt, usage_raw, resp, latency_ms, finish, error_body=err_body
+            attempt,
+            usage_raw,
+            resp,
+            latency_ms,
+            finish,
+            error_body=err_body,
+            response_model=str(err_data["model"]) if err_data.get("model") else None,
+            request_id=_request_id(resp, err_data or None),
         )
         turn = ModelTurn(
             content=None,
             finish_reason="error",
             usage=usage_raw,
             http_status=resp.status_code,
-            request_id=_request_id(resp),
+            request_id=_request_id(resp, err_data or None),
             latency_ms=latency_ms,
             error_body=err_body,
         )
@@ -607,26 +706,33 @@ class OpenAIChatProvider:
     ) -> ModelTurn:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
+        self.last_assistant_message = dict(message)
         finish = choice.get("finish_reason") or "stop"
         tool_calls: list[ToolCallSpec] = []
         for tc in message.get("tool_calls") or []:
             fn = tc.get("function") or {}
+            raw_args = fn.get("arguments")
+            if raw_args is None:
+                arg_str = ""
+            else:
+                arg_str = raw_args
             tool_calls.append(
                 ToolCallSpec(
                     id=tc.get("id", ""),
                     name=fn.get("name", ""),
-                    arguments=fn.get("arguments") or "{}",
+                    arguments=arg_str,
                 )
             )
         return ModelTurn(
             content=message.get("content"),
             tool_calls=tool_calls,
-            reasoning_content=message.get("reasoning_content"),
+            reasoning_content=extract_reasoning_content(message),
             finish_reason=finish,
             usage=data.get("usage") or {},
             http_status=resp.status_code,
-            request_id=_request_id(resp),
+            request_id=_request_id(resp, data),
             latency_ms=latency_ms,
+            response_model=str(data["model"]) if data.get("model") else None,
         )
 
     async def complete(
@@ -638,6 +744,7 @@ class OpenAIChatProvider:
         thinking_enabled: bool | None = None,
         estimated_input_tokens: int | None = None,
         stream: bool = False,
+        tool_choice: Any | None = None,
     ) -> ModelTurn:
         mtoks = max_tokens if max_tokens is not None else self.max_tokens
         think = self.thinking_enabled if thinking_enabled is None else thinking_enabled
@@ -647,7 +754,9 @@ class OpenAIChatProvider:
             max_tokens=mtoks,
             thinking_enabled=think,
             stream=stream,
+            tool_choice=tool_choice,
         )
+        self.last_request_bodies.append(scrub_request_body(body))
         est_in = (
             estimated_input_tokens
             if estimated_input_tokens is not None

@@ -44,4 +44,9 @@ async def test_stream_one_completion_live() -> None:
     assert turn.http_status == 200
     assert len(turn.http_calls) == 1
     assert ledger.total_tokens_used() > 0
+    print(
+        f"LIVE_METRIC stream_one_completion "
+        f"http_status={turn.http_status} finish_reason={turn.finish_reason} "
+        f"response_model={turn.response_model} usage={turn.usage!r}"
+    )
     print(f"ledger_cumulative_tokens={ledger.total_tokens_used()}")

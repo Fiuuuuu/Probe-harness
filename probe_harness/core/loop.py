@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Protocol
 
+from probe_harness.core.context import prepare_context
 from probe_harness.providers.base import HttpCallRecord, ModelTurn, ProviderCallError
+from probe_harness.providers.guards import is_truncated_turn
 from probe_harness.providers.ledger import TokenCapReached
 from probe_harness.providers.openai_chat import request_sha256
 from probe_harness.providers.usage import (
@@ -19,7 +22,7 @@ from probe_harness.providers.usage import (
     normalise_openai_usage,
 )
 from probe_harness.store.db import EventWriter, Store
-from probe_harness.tools.names import normalise_tool_name
+from probe_harness.tools.names import ToolNameMap, denormalise_tool_name, normalise_tool_name
 from probe_harness.tools.registry import TOOL_SCHEMAS, execute_tool
 
 
@@ -70,13 +73,16 @@ async def _persist_model_calls(
     req_hash = request_sha256(req_body)
     for call_row in call_rows:
         row_usage = _normalise_usage(provider_name, call_row.usage)
+        stop = call_row.stop_reason or turn.finish_reason
+        if call_row.usage_estimated:
+            stop = f"{stop}|usage_estimated"
         await store.execute(
             """
             INSERT INTO model_calls (
                 run_id, step, attempt, input_total, cached_read, cache_write,
                 uncached, output, reasoning, stop_reason, latency_ms,
-                request_sha256, http_status, request_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                request_sha256, http_status, request_id, response_model
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -88,11 +94,12 @@ async def _persist_model_calls(
                 row_usage["uncached"],
                 row_usage["output"],
                 row_usage["reasoning"],
-                call_row.stop_reason or turn.finish_reason,
+                stop,
                 call_row.latency_ms,
                 req_hash,
                 call_row.http_status,
                 call_row.request_id,
+                call_row.response_model or turn.response_model,
             ),
         )
 
@@ -147,6 +154,14 @@ def _record_loop_exception(exc: BaseException) -> tuple[str, str, BaseException]
     return "failed", "exception", exc
 
 
+def _allow_task_test_controls(task_path: Path) -> bool:
+    """Task JSON knobs (tool_choice, reject_length_*) are for tests/live probes only."""
+    if os.environ.get("HARNESS_ALLOW_TEST_CONTROLS") == "1":
+        return True
+    resolved = str(task_path.resolve())
+    return "/tests/" in resolved or "/tmp/" in resolved or "pytest-" in resolved
+
+
 async def run_agent_loop(
     store: Store,
     provider: ChatProvider,
@@ -189,6 +204,8 @@ async def run_agent_loop(
     ]
 
     script = task.get("fake_script") or []
+    name_map = ToolNameMap()
+    thinking_enabled = task.get("thinking_enabled")
     if provider_name == "fake" and script:
         from probe_harness.providers.fake import FakeProvider
 
@@ -204,47 +221,120 @@ async def run_agent_loop(
     try:
         while step < max_steps:
             try:
+                provider_messages, repairs, api_tools = prepare_context(
+                    messages,
+                    TOOL_SCHEMAS,
+                    repair_reason=task.get("pairing_repair_reason", "interrupted"),
+                    name_map=name_map,
+                )
+                for repair in repairs:
+                    await events.append(
+                        run_id,
+                        step,
+                        "protocol_repair",
+                        time.time(),
+                        json.dumps(repair, ensure_ascii=False),
+                    )
+
+                await events.append(
+                    run_id,
+                    step,
+                    "context_prepared",
+                    time.time(),
+                    json.dumps(
+                        {
+                            "step": step,
+                            "message_count": len(provider_messages),
+                            "repairs": len(repairs),
+                        }
+                    ),
+                )
+
                 await events.append(
                     run_id,
                     step,
                     "model_request",
                     time.time(),
-                    json.dumps({"step": step, "message_count": len(messages)}),
+                    json.dumps({"step": step, "message_count": len(provider_messages)}),
                 )
 
                 max_tok = task.get("max_tokens", 8192)
-                est_in = estimate_chat_input_tokens(messages, TOOL_SCHEMAS)
+                est_in = estimate_chat_input_tokens(provider_messages, api_tools)
                 use_stream = bool(task.get("stream", False)) and provider_name == "deepseek"
-                turn = await provider.complete(
-                    messages,
-                    tools=TOOL_SCHEMAS,
-                    max_tokens=max_tok,
-                    estimated_input_tokens=est_in,
-                    stream=use_stream,
-                )
+                complete_kwargs: dict[str, Any] = {
+                    "max_tokens": max_tok,
+                    "estimated_input_tokens": est_in,
+                    "stream": use_stream,
+                }
+                if thinking_enabled is not None:
+                    complete_kwargs["thinking_enabled"] = bool(thinking_enabled)
+                test_controls = _allow_task_test_controls(task_path)
+                if test_controls and task.get("tool_choice") is not None:
+                    complete_kwargs["tool_choice"] = task.get("tool_choice")
 
-                call_rows = turn.http_calls or [
-                    HttpCallRecord(
-                        attempt=1,
-                        usage=turn.usage,
-                        http_status=turn.http_status,
-                        request_id=turn.request_id,
-                        latency_ms=turn.latency_ms,
-                        stop_reason=turn.finish_reason,
-                        error_body=turn.error_body,
+                empty_retries = 0
+                max_empty = int(task.get("max_length_empty_retries", 3)) if test_controls else 0
+                turn = None
+                call_rows: list[HttpCallRecord] = []
+                while True:
+                    turn = await provider.complete(
+                        provider_messages,
+                        tools=api_tools,
+                        **complete_kwargs,
                     )
-                ]
+                    call_rows = turn.http_calls or [
+                        HttpCallRecord(
+                            attempt=1,
+                            usage=turn.usage,
+                            http_status=turn.http_status,
+                            request_id=turn.request_id,
+                            latency_ms=turn.latency_ms,
+                            stop_reason=turn.finish_reason,
+                            error_body=turn.error_body,
+                            response_model=turn.response_model,
+                        )
+                    ]
+                    reject_empty = test_controls and bool(
+                        task.get("reject_length_without_tool_calls")
+                    )
+                    if reject_empty and turn.finish_reason == "length" and not turn.tool_calls:
+                        empty_retries += 1
+                        if empty_retries >= max_empty:
+                            stop_reason = "provider_error"
+                            status = "failed"
+                            error_detail = {
+                                "error": (
+                                    "length finish_reason without tool_calls after "
+                                    f"{max_empty} attempts"
+                                ),
+                                "finish_reason": turn.finish_reason,
+                            }
+                            await events.append(
+                                run_id,
+                                step,
+                                "provider_error",
+                                time.time(),
+                                json.dumps(error_detail),
+                            )
+                            break
+                        continue
+                    break
+
+                assert turn is not None
                 await _persist_model_calls(
                     store,
                     run_id=run_id,
                     step=step,
                     model=model,
-                    messages=messages,
+                    messages=provider_messages,
                     max_tok=max_tok,
                     turn=turn,
                     call_rows=call_rows,
                     provider_name=provider_name,
                 )
+
+                if status == "failed" and stop_reason == "provider_error":
+                    break
 
                 if turn.finish_reason == "stream_interrupted":
                     stop_reason = "provider_error"
@@ -260,8 +350,11 @@ async def run_agent_loop(
                     break
 
                 assistant_msg: dict[str, Any] = {"role": "assistant", "content": turn.content}
+                think_on = thinking_enabled if thinking_enabled is not None else False
                 if turn.reasoning_content:
                     assistant_msg["reasoning_content"] = turn.reasoning_content
+                elif think_on and turn.tool_calls:
+                    assistant_msg["reasoning_content"] = ""
                 if turn.tool_calls:
                     assistant_msg["tool_calls"] = [
                         {
@@ -276,6 +369,8 @@ async def run_agent_loop(
                 resp_payload = {
                     "finish_reason": turn.finish_reason,
                     "tool_calls": len(turn.tool_calls),
+                    "response_model": turn.response_model,
+                    "request_id": turn.request_id,
                 }
                 await events.append(
                     run_id,
@@ -302,8 +397,70 @@ async def run_agent_loop(
                     stop_reason = turn.finish_reason or "stop"
                     break
 
+                truncated = bool(turn.tool_calls) and (
+                    turn.finish_reason in {"length", "max_tokens"}
+                    or is_truncated_turn(
+                        turn.tool_calls,
+                        finish_reason=turn.finish_reason,
+                        max_tokens=max_tok,
+                        usage=turn.usage,
+                        provider_name=provider_name,
+                    )
+                )
+                if truncated:
+                    for tc in turn.tool_calls:
+                        payload = json.dumps(
+                            {
+                                "error": "tool call truncated: incomplete arguments",
+                                "is_error": True,
+                                "truncated": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "content": payload,
+                            }
+                        )
+                        await events.append(
+                            run_id,
+                            step,
+                            "protocol_repair",
+                            time.time(),
+                            json.dumps(
+                                {
+                                    "kind": "truncation",
+                                    "tool_call_id": tc.id,
+                                    "finish_reason": turn.finish_reason,
+                                }
+                            ),
+                        )
+                    step += 1
+                    continue
+
+                if provider_name == "fake" and task.get("simulate_interrupt_before_tool_results"):
+                    step += 1
+                    continue
+
+                if provider_name == "fake" and task.get("simulate_interrupt_before_approval"):
+                    await events.append(
+                        run_id,
+                        step,
+                        "approval_requested",
+                        time.time(),
+                        json.dumps(
+                            {"call_id": turn.tool_calls[0].id, "simulated": True},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    step += 1
+                    continue
+
                 for tc in turn.tool_calls:
-                    norm = normalise_tool_name(tc.name)
+                    raw_name = denormalise_tool_name(tc.name, name_map=name_map)
+                    norm = normalise_tool_name(raw_name, name_map=name_map)
                     args_sha = hashlib.sha256(tc.arguments.encode()).hexdigest()
                     await events.append(
                         run_id,
@@ -313,7 +470,10 @@ async def run_agent_loop(
                         json.dumps({"call_id": tc.id, "name": norm}),
                     )
                     try:
-                        result, exit_code, duration_ms = await execute_tool(norm, tc.arguments)
+                        result, exit_code, duration_ms = await execute_tool(
+                            raw_name,
+                            tc.arguments,
+                        )
                     except Exception as exc:
                         result = {"error": f"tool execution failed: {exc}", "is_error": True}
                         exit_code = 1
@@ -331,7 +491,7 @@ async def run_agent_loop(
                             run_id,
                             step,
                             tc.id,
-                            tc.name,
+                            raw_name,
                             norm,
                             args_sha,
                             "ok" if exit_code == 0 else "error",

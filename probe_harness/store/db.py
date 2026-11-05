@@ -29,7 +29,14 @@ class Store:
         await self._conn.execute("PRAGMA foreign_keys=ON")
         schema = _SCHEMA_PATH.read_text(encoding="utf-8")
         await self._conn.executescript(schema)
+        await self._migrate(self._conn)
         await self._conn.commit()
+
+    async def _migrate(self, conn: aiosqlite.Connection) -> None:
+        cur = await conn.execute("PRAGMA table_info(model_calls)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "response_model" not in cols:
+            await conn.execute("ALTER TABLE model_calls ADD COLUMN response_model TEXT")
 
     async def close(self) -> None:
         if self._conn:

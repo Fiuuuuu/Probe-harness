@@ -10,8 +10,8 @@ Primary provider is DeepSeek (DECISIONS D4). Every rule here needs an offline re
 |---|---|---|---|
 | Use model `deepseek-flash` on `https://api.deepseek.com` (OpenAI format). It supports tool calls, thinking and non-thinking modes, 1M context. | DOC | https://api-docs.deepseek.com/quick_start/pricing | net-check only |
 | Set thinking explicitly per request: `{"thinking":{"type":"enabled"}}` + `reasoning_effort` (low/high/max) or `{"type":"disabled"}`. Thinking is ON by default (effort high). In thinking mode temperature/penalties have no effect. | DOC; default-on consistent with probe g1 (13 reasoning tokens with the param omitted) | https://api-docs.deepseek.com/guides/thinking_mode | yes (both modes) |
-| Thinking enabled + tools: `reasoning_content` of every previous assistant turn must be passed back, else HTTP 400. | MEASURED g7 (400 without) / g9 (200 with); DOC | https://api-docs.deepseek.com/guides/thinking_mode#tool-calls | yes |
-| With the thinking param omitted, dropping `reasoning_content` still returned 200 (g2/g6). Contradicts the doc; do not rely on it — always pass it back. | MEASURED g2/g6 | fixtures | yes (regression) |
+| Thinking enabled + tools: on continuation after a tool result, an assistant tool-call turn in the request must include that turn's `reasoning_content` when replaying a prior model tool call — missing it returns HTTP **400** (MEASURED **g7**); with passback returns **200** (MEASURED **g9**). | MEASURED g7/g9; DOC | https://api-docs.deepseek.com/guides/thinking_mode#tool-calls | yes (g7/g9) |
+| Stripping `reasoning_content` from prior assistant tool turns in a longer multi-turn chat (then continuing with thinking enabled) has **measured HTTP 200** on DeepSeek (Round 4 live); do not rely on the API to enforce passback in that shape — the harness must always store and replay `reasoning_content` verbatim. | MEASURED Round 4 live + g2/g6 (thinking param omitted → drop still 200) | fixtures | yes (regression) |
 | Tool names: only `a-z A-Z 0-9 _ -`, max length 128 (DOC). A name with `.` or `/` → 400 (MEASURED f). A 70-char name → 200 (MEASURED f; 128 itself not tested). Normalise all names (see C4). | MEASURED + DOC | https://api-docs.deepseek.com/api/create-chat-completion | yes |
 | Usage: `prompt_tokens = prompt_cache_hit_tokens + prompt_cache_miss_tokens`; `prompt_tokens_details.cached_tokens` = hit; `completion_tokens_details.reasoning_tokens` is inside `completion_tokens`. Normalise: input_total = prompt_tokens, cached_read = hit, uncached = miss, output = completion_tokens. Repeat of an identical 1,972-token prompt hit 1,792 cached (h2/h3). | MEASURED d/h/g; DOC | create-chat-completion reference | yes |
 | Streaming: a usage chunk arrived even WITHOUT `stream_options.include_usage` (MEASURED j_stream_no_include_usage). The API reference says usage is absent unless include_usage=true → always send `include_usage: true` and also accept usage when it appears unrequested. | MEASURED j; DOC conflicts | create-chat-completion reference | yes |
@@ -39,9 +39,10 @@ Pricing reference (DOC, read 2026-11-05, per 1M tokens, `deepseek-flash`, off-pe
 - MCP names `mcp__{server}__{tool}`: parse from the map, never by splitting on `__`.
 
 ## C5 Reasoning / thinking passback
-- DeepSeek: see C12 (MEASURED g7/g9; LIVE TEST).
+- DeepSeek live contract (MEASURED): **g7** — `thinking` enabled, messages end with user → assistant tool call (no `reasoning_content`) → tool result; next completion → HTTP **400** (`reasoning_content` must be passed back). **g9** — same with `reasoning_content` on the assistant tool turn → HTTP **200**.
+- Longer multi-turn histories with `reasoning_content` removed from earlier assistant tool turns may still get HTTP **200** from DeepSeek when continuing (measured Round 4); that is not permission to omit passback in the harness.
 - MiniMax (optional adapter): DOC requires passing back the full content incl. thinking blocks (with signature). MiniMax-M3 thinking is OFF by default on the Anthropic endpoint and ON by default on the OpenAI endpoint (`<think>` in content). Passback-failure behaviour UNTESTED.
-- Required: store reasoning/thinking blocks verbatim per assistant message and replay them.
+- Required: store reasoning/thinking blocks verbatim per assistant message and replay them on every model request when thinking is enabled.
 
 ## C6 Truncation (stop_reason)
 - With max_tokens=40 mid tool call (MEASURED i): MiniMax-Anthropic stop_reason `tool_use` with valid-but-truncated input; MiniMax-OpenAI finish_reason `tool_calls`; DeepSeek finish_reason `length` with invalid JSON.

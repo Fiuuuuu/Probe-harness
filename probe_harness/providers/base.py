@@ -24,6 +24,8 @@ class HttpCallRecord:
     latency_ms: int
     stop_reason: str = ""
     error_body: str = ""
+    usage_estimated: bool = False
+    response_model: str | None = None
 
 
 @dataclass
@@ -38,6 +40,7 @@ class ModelTurn:
     latency_ms: int = 0
     http_calls: list[HttpCallRecord] = field(default_factory=list)
     error_body: str = ""
+    response_model: str | None = None
 
 
 class ProviderCallError(Exception):

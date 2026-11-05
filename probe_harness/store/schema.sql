@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS model_calls (
     request_sha256 TEXT,
     http_status INTEGER,
     request_id TEXT,
+    response_model TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
 

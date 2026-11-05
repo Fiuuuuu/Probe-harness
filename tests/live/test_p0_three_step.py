@@ -53,6 +53,15 @@ async def test_three_step_tool_task_live(tmp_path: Path) -> None:
         "SELECT input_total, output FROM model_calls WHERE run_id = ?",
         (run_id,),
     )
+    last_mc = await store.fetchone(
+        "SELECT response_model FROM model_calls WHERE run_id = ? ORDER BY step DESC LIMIT 1",
+        (run_id,),
+    )
+    print(
+        f"LIVE_METRIC three_step_tool_task stop_reason={run['stop_reason']} "
+        f"response_model={last_mc['response_model'] if last_mc else None} "
+        f"model_calls={len(model_calls)}"
+    )
     assert len(model_calls) >= 1
     total_in = sum(c["input_total"] for c in model_calls)
     total_out = sum(c["output"] for c in model_calls)
