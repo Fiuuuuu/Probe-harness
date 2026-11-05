@@ -1,5 +1,7 @@
 # BASELINE.md — real measured numbers (the only numbers the project may quote)
 
+**All numbers below were measured with MiniMax-M3** (Anthropic-compatible endpoint), not with DeepSeek. **A DeepSeek baseline has not been measured yet**; the first one comes from the T6 smoke run. Do not compare DeepSeek results to these numbers as if they were the same model.
+
 Task: SWE-bench Lite `pytest-dev__pytest-7432`, model MiniMax-M3 (Anthropic-compatible endpoint), 2026-11-02..04. One run per configuration — anecdotal, not statistically meaningful.
 
 | Metric | R1: reference system, benchmark defaults | R2: reference system, token budget unlimited | M: mini-swe-agent 2.4.6 |
