@@ -121,6 +121,10 @@ async def edit_file(path: str, old_string: str, new_string: str) -> dict[str, An
     return {"replaced": True}
 
 
+async def submit(summary: str = "") -> dict[str, Any]:
+    return {"submitted": True, "summary": summary}
+
+
 async def glob_paths(pattern: str) -> dict[str, Any]:
     ws = _workspace()
     matches: list[str] = []
@@ -200,6 +204,18 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "submit",
+            "description": "Submit the task for goal evaluation when work is complete",
+            "parameters": {
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": [],
+            },
+        },
+    },
 ]
 
 
@@ -229,6 +245,8 @@ async def execute_tool(name: str, arguments_json: str) -> tuple[dict[str, Any], 
             )
         elif name == "glob":
             result = await glob_paths(str(args.get("pattern", "*")))
+        elif name == "submit":
+            result = await submit(str(args.get("summary", "")))
         else:
             result = {"error": f"unknown tool: {name}", "is_error": True}
     except Exception as exc:

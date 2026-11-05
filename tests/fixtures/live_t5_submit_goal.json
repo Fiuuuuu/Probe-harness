@@ -1,0 +1,8 @@
+{
+  "system": "You are a concise agent. Use write_file then submit when done.",
+  "user_message": "Create success.txt in the workspace containing exactly the word SUCCESS (no extra text), then call the submit tool with a one-line summary.",
+  "goal": {"type": "file_contains", "path": "success.txt", "text": "SUCCESS"},
+  "max_steps": 6,
+  "max_tokens": 512,
+  "thinking_enabled": false
+}

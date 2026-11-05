@@ -15,6 +15,7 @@ def checkpoint_meta(
     fake_script_index: int = 0,
     hook_metrics: dict[str, int] | None = None,
     model_response_done: bool = False,
+    budget: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "fake_script_index": fake_script_index,
@@ -22,6 +23,8 @@ def checkpoint_meta(
     }
     if hook_metrics:
         payload["hook_metrics"] = hook_metrics
+    if budget is not None:
+        payload["budget"] = budget
     return payload
 
 
@@ -71,7 +74,7 @@ async def save_checkpoint(
 async def load_latest_checkpoint(store: Store, run_id: str) -> dict[str, Any] | None:
     rows = await store.fetchall(
         """
-        SELECT step, boundary, messages_json, usage_json
+        SELECT step, boundary, messages_json, usage_json, budget_json
         FROM checkpoints
         WHERE run_id = ?
         ORDER BY step DESC,
@@ -84,9 +87,17 @@ async def load_latest_checkpoint(store: Store, run_id: str) -> dict[str, Any] | 
         return None
     row = rows[0]
     meta = json.loads(row["usage_json"] or "{}")
+    budget_raw = row["budget_json"] if row["budget_json"] else "{}"
+    try:
+        budget = json.loads(budget_raw) if budget_raw else {}
+    except json.JSONDecodeError:
+        budget = {}
+    if not budget and isinstance(meta.get("budget"), dict):
+        budget = meta["budget"]
     return {
         "step": int(row["step"]),
         "boundary": row["boundary"],
         "messages": json.loads(row["messages_json"]),
         "meta": meta,
+        "budget": budget,
     }

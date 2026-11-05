@@ -35,6 +35,7 @@ class RecoveryContext:
     provider_name: str
     model: str
     config_hash_value: str
+    budget_state: dict[str, Any] | None = None
     resume_at_tools: bool = False
 
 
@@ -57,6 +58,7 @@ async def recover_run(
 
     task_path = Path(source["task_ref"])
     meta = ckpt.get("meta") or {}
+    budget_state = ckpt.get("budget") or meta.get("budget")
     fake_script_index = int(meta.get("fake_script_index", 0))
     model_response_done = bool(meta.get("model_response_done"))
     step = int(ckpt["step"])
@@ -120,5 +122,6 @@ async def recover_run(
         provider_name=provider_name,
         model=model,
         config_hash_value=cfg,
+        budget_state=budget_state if isinstance(budget_state, dict) else None,
         resume_at_tools=resume_at_tools,
     )
