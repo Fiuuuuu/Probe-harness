@@ -1,0 +1,16 @@
+{
+  "_comment": "TEST-ONLY fixture for unit/offline eval; not for production SWE-bench runs.",
+  "system": "You are a software engineering agent. Use the provided tools to inspect and edit the repository, run tests, and fix the reported issue. When you believe the fix is complete, call submit.",
+  "user_message_template": "Fix the following issue in this repository.\n\n{problem_statement}\n\nWork in the checkout under HARNESS_WORKSPACE. Run relevant tests before submit.",
+  "max_steps": 50,
+  "max_tokens": 8192,
+  "thinking_enabled": true,
+  "budget": {
+    "tokens": [80000, 100000, 120000],
+    "calls": [48, 56, 64]
+  },
+  "goal": {
+    "type": "always_pass",
+    "_test_only": true
+  }
+}

@@ -308,6 +308,7 @@ async def run_agent_loop(
     max_steps: int = 20,
     hook_bus: HookBus | None = None,
     recover_from: str | None = None,
+    run_id: str | None = None,
 ) -> str:
     task = load_task(task_path)
     events = EventWriter(store)
@@ -331,7 +332,7 @@ async def run_agent_loop(
         fake_script_index = recovery_ctx.fake_script_index
         skip_model_once = recovery_ctx.resume_at_tools
     else:
-        run_id = str(uuid.uuid4())
+        run_id = run_id or str(uuid.uuid4())
         lineage_run_id = run_id
         fake_script_index = 0
         step = 0
