@@ -34,6 +34,26 @@ def _as_int(value: Any, default: int) -> int:
         return default
 
 
+_active_bash_procs: set[asyncio.subprocess.Process] = set()
+
+
+def _kill_bash_process_group(proc: asyncio.subprocess.Process) -> None:
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+def cancel_all_bash_processes() -> None:
+    """Kill every in-flight bash process group (e.g. on run cancel)."""
+    for proc in list(_active_bash_procs):
+        _kill_bash_process_group(proc)
+    _active_bash_procs.clear()
+
+
 async def run_bash(command: str, timeout: float = 120.0) -> dict[str, Any]:
     proc = await asyncio.create_subprocess_shell(
         command,
@@ -42,21 +62,29 @@ async def run_bash(command: str, timeout: float = 120.0) -> dict[str, Any]:
         cwd=_workspace(),
         start_new_session=True,
     )
+    _active_bash_procs.add(proc)
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except ProcessLookupError:
-            proc.kill()
-        await proc.wait()
-        return {"exit_code": -1, "stdout": "", "stderr": "timeout", "truncated": False}
-    return {
-        "exit_code": proc.returncode,
-        "stdout": stdout.decode(errors="replace"),
-        "stderr": stderr.decode(errors="replace"),
-        "truncated": False,
-    }
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except TimeoutError:
+            _kill_bash_process_group(proc)
+            await proc.wait()
+            return {"exit_code": -1, "stdout": "", "stderr": "timeout", "truncated": False}
+        except asyncio.CancelledError:
+            _kill_bash_process_group(proc)
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            raise
+        return {
+            "exit_code": proc.returncode,
+            "stdout": stdout.decode(errors="replace"),
+            "stderr": stderr.decode(errors="replace"),
+            "truncated": False,
+        }
+    finally:
+        _active_bash_procs.discard(proc)
 
 
 async def read_file(path: str, offset: int = 0, limit: int = 2000) -> dict[str, Any]:

@@ -11,9 +11,9 @@ from probe_harness.providers.base import ModelTurn, ToolCallSpec
 class FakeProvider:
     """Replays a list of scripted turn dicts from a task file."""
 
-    def __init__(self, script: list[dict[str, Any]]) -> None:
+    def __init__(self, script: list[dict[str, Any]], *, start_index: int = 0) -> None:
         self._script = list(script)
-        self._index = 0
+        self._index = max(0, start_index)
 
     async def complete(
         self,

@@ -202,13 +202,24 @@ async def test_live_thinking_modes_explicit() -> None:
         thinking_enabled=True,
         test_run_id="live-thinking-modes",
     )
-    prompt = [{"role": "user", "content": "Reply with exactly: mode-check"}]
-    off = await provider.complete(prompt, max_tokens=32, thinking_enabled=False)
+    prompt = [
+        {
+            "role": "user",
+            "content": (
+                "A shop sells notebooks for 7 yuan each and pens for 3 yuan each. "
+                "Mei buys 4 notebooks and 5 pens, then returns 2 pens. "
+                "How much did she spend in yuan? Show your reasoning, then give the final "
+                "number on the last line only."
+            ),
+        }
+    ]
+    off = await provider.complete(prompt, max_tokens=128, thinking_enabled=False)
     assert off.http_status == 200
     body_off = provider.last_request_bodies[-1]
     assert body_off.get("thinking") == {"type": "disabled"}
+    assert "reasoning_effort" not in body_off or body_off.get("reasoning_effort") is None
 
-    on = await provider.complete(prompt, max_tokens=64, thinking_enabled=True)
+    on = await provider.complete(prompt, max_tokens=512, thinking_enabled=True)
     await provider.aclose()
     assert on.http_status == 200
     body_on = provider.last_request_bodies[-1]
@@ -218,15 +229,23 @@ async def test_live_thinking_modes_explicit() -> None:
     on_details = (on.usage or {}).get("completion_tokens_details") or {}
     off_reasoning = int(off_details.get("reasoning_tokens") or 0)
     on_reasoning = int(on_details.get("reasoning_tokens") or 0)
+    off_rc = (off.reasoning_content or "").strip()
+    on_rc = (on.reasoning_content or "").strip()
     assert off_reasoning == 0, json.dumps(off.usage, sort_keys=True)
-    assert on_reasoning > 0, json.dumps(on.usage, sort_keys=True)
+    assert not off_rc, f"unexpected reasoning_content with thinking off: {off_rc[:200]!r}"
+    assert on_reasoning > 0 or bool(on_rc), (
+        f"thinking on must produce reasoning_tokens or reasoning_content; "
+        f"usage={json.dumps(on.usage, sort_keys=True)} reasoning_content_len={len(on_rc)}"
+    )
     print(
         f"LIVE_METRIC thinking_off response_model={off.response_model} "
         f"finish_reason={off.finish_reason} reasoning_tokens={off_reasoning} "
+        f"reasoning_content_len={len(off_rc)} "
         f"usage={json.dumps(off.usage, sort_keys=True)}"
     )
     print(
         f"LIVE_METRIC thinking_on response_model={on.response_model} "
         f"finish_reason={on.finish_reason} reasoning_tokens={on_reasoning} "
+        f"reasoning_content_len={len(on_rc)} "
         f"usage={json.dumps(on.usage, sort_keys=True)}"
     )
